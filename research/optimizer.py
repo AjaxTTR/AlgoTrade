@@ -5,7 +5,9 @@ Runs a grid search over a parameter space, backtests each combination,
 and saves ranked results to research/results.csv.
 
 Usage:
-    python -m research.optimizer
+    python -m research.optimizer [strategy_name]
+
+If no strategy name is provided, defaults to "strategy".
 """
 
 import importlib
@@ -33,7 +35,6 @@ log = logging.getLogger(__name__)
 # Configuration
 # ---------------------------------------------------------------------------
 DATA_FILE = "data/nq_15m_data.csv"
-STRATEGY_NAME = "strategy"
 
 BACKTEST_CONFIG = {
     "initial_capital": 100_000.0,
@@ -69,8 +70,14 @@ def _build_combos(grid: dict) -> list[dict]:
 # Main
 # ---------------------------------------------------------------------------
 
-def optimize() -> pd.DataFrame:
-    """Run grid search and return a DataFrame of results."""
+def optimize(strategy_name: str = "strategy") -> pd.DataFrame:
+    """Run grid search and return a DataFrame of results.
+
+    Parameters
+    ----------
+    strategy_name : str
+        Name of the strategy module inside strategies/ to optimise.
+    """
     t_start = time.perf_counter()
 
     # Load data once
@@ -83,15 +90,15 @@ def optimize() -> pd.DataFrame:
     log.info("Loaded %s bars", f"{len(df):,}")
 
     # Load strategy module once
-    log.info("Loading strategy: %s", STRATEGY_NAME)
+    log.info("Loading strategy: %s", strategy_name)
     try:
-        strategy_module = importlib.import_module(f"strategies.{STRATEGY_NAME}")
+        strategy_module = importlib.import_module(f"strategies.{strategy_name}")
     except ModuleNotFoundError:
-        log.error("Strategy module 'strategies/%s.py' not found.", STRATEGY_NAME)
+        log.error("Strategy module 'strategies/%s.py' not found.", strategy_name)
         sys.exit(1)
 
     if not hasattr(strategy_module, "generate_signals"):
-        log.error("Strategy '%s' missing generate_signals().", STRATEGY_NAME)
+        log.error("Strategy '%s' missing generate_signals().", strategy_name)
         sys.exit(1)
 
     # Build parameter combinations
@@ -111,7 +118,7 @@ def optimize() -> pd.DataFrame:
             trades = metrics["trades"]
 
             results.append({
-                "strategy_name": STRATEGY_NAME,
+                "strategy_name": strategy_name,
                 **params,
                 "total_return": mtm["total_return"],
                 "sharpe": mtm["sharpe"],
@@ -123,7 +130,7 @@ def optimize() -> pd.DataFrame:
         except Exception as exc:
             log.warning("Combo %d/%d failed (%s): %s", i, total, params, exc)
             results.append({
-                "strategy_name": STRATEGY_NAME,
+                "strategy_name": strategy_name,
                 **params,
                 "total_return": None,
                 "sharpe": None,
@@ -163,4 +170,5 @@ def optimize() -> pd.DataFrame:
 
 
 if __name__ == "__main__":
-    optimize()
+    name = sys.argv[1] if len(sys.argv) > 1 else "strategy"
+    optimize(name)
