@@ -21,6 +21,7 @@ def generate_signals(
     entry_cutoff: str = "14:30",
     atr_period: int = 14,
     tp_atr_multiple: float = 2.0,
+    min_orb_atr_ratio: float = 0.3,
     **kwargs,
 ) -> pd.DataFrame:
     """Opening Range Breakout strategy anchored to session open.
@@ -49,6 +50,9 @@ def generate_signals(
         Lookback for ATR calculation (default 14).
     tp_atr_multiple : float
         ATR multiplier for take-profit distance (default 2.0).
+    min_orb_atr_ratio : float
+        Minimum ORB width as a fraction of ATR (default 0.3).
+        Days where orb_width < ATR * ratio produce no signals.
 
     Returns
     -------
@@ -117,9 +121,13 @@ def generate_signals(
     out["range_high"] = range_high_daily
     out["range_low"] = range_low_daily
 
-    # Breakout conditions (only after ORB window closes)
-    long_break = after_orb & (out["close"] > out["range_high"])
-    short_break = after_orb & (out["close"] < out["range_low"])
+    # ORB width filter: skip days where range is too narrow relative to ATR
+    orb_width = out["range_high"] - out["range_low"]
+    valid_range = orb_width >= (out["atr"] * min_orb_atr_ratio)
+
+    # Breakout conditions (only after ORB window closes, with width filter)
+    long_break = after_orb & (out["close"] > out["range_high"]) & valid_range
+    short_break = after_orb & (out["close"] < out["range_low"]) & valid_range
 
     # Build raw signal
     raw_signal = np.zeros(n, dtype=np.int8)
