@@ -16,22 +16,25 @@ import numpy as np
 def generate_signals(
     df: pd.DataFrame,
     orb_minutes: int = 30,
+    session_start: str = "09:30",
     **kwargs,
 ) -> pd.DataFrame:
-    """Opening Range Breakout strategy.
+    """Opening Range Breakout strategy anchored to session open.
 
-    Computes the high and low of the first *orb_minutes* of each trading
-    day, then generates a long signal on the first bar that closes above
-    the range high and a short signal on the first bar that closes below
-    the range low.  Only one signal per direction per day.
+    Computes the high and low of the first *orb_minutes* after
+    *session_start* each trading day, then generates a long signal on
+    the first bar that closes above the range high and a short signal
+    on the first bar that closes below the range low.  Only one signal
+    per direction per day.
 
     Parameters
     ----------
     df : pd.DataFrame
         OHLCV data with a DatetimeIndex (intraday frequency).
     orb_minutes : int
-        Number of minutes from the start of each day's session used to
-        define the opening range (default 30).
+        Length of the opening range window in minutes (default 30).
+    session_start : str
+        Session open time in "HH:MM" format (default "09:30").
 
     Returns
     -------
@@ -45,20 +48,30 @@ def generate_signals(
     out = df.copy()
     n = len(out)
 
-    # Trading date for each bar
-    dates = out.index.date
+    # Parse session start into hour and minute
+    ss_hour, ss_min = (int(x) for x in session_start.split(":"))
 
-    # First bar timestamp of each day
-    date_series = pd.Series(dates, index=out.index)
-    first_bar_time = date_series.groupby(dates).transform("idxmin")
+    # Bar time components
+    bar_times = out.index
+    bar_hours = bar_times.hour
+    bar_minutes = bar_times.minute
+    dates = bar_times.date
 
-    # Minutes elapsed since each day's first bar
-    minutes_elapsed = (out.index - first_bar_time).total_seconds() / 60.0
+    # Minutes since midnight for each bar and for session start
+    bar_mins_since_midnight = bar_hours * 60 + bar_minutes
+    session_start_mins = ss_hour * 60 + ss_min
+    session_end_mins = session_start_mins + orb_minutes
 
-    # Bars within the opening range window
-    is_orb_window = minutes_elapsed < orb_minutes
+    # ORB window: bars at or after session_start and before session_start + orb_minutes
+    is_orb_window = (
+        (bar_mins_since_midnight >= session_start_mins)
+        & (bar_mins_since_midnight < session_end_mins)
+    )
 
-    # Compute opening range high/low per day using only ORB bars
+    # After ORB: bars at or after the ORB window closes
+    after_orb = bar_mins_since_midnight >= session_end_mins
+
+    # Compute opening range high/low per day using only ORB window bars
     orb_high = out["high"].where(is_orb_window)
     orb_low = out["low"].where(is_orb_window)
 
@@ -68,9 +81,7 @@ def generate_signals(
     out["range_high"] = range_high_daily
     out["range_low"] = range_low_daily
 
-    # After the ORB window, check for breakouts
-    after_orb = ~is_orb_window
-
+    # Breakout conditions (only after ORB window closes)
     long_break = after_orb & (out["close"] > out["range_high"])
     short_break = after_orb & (out["close"] < out["range_low"])
 
