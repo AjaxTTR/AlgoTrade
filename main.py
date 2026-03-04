@@ -9,6 +9,7 @@ Outputs: trade_log.csv, equity_curve.csv, drawdown_series.csv,
          performance_metrics.json, backtest_results.png
 """
 
+import importlib
 import json
 import logging
 import sys
@@ -19,7 +20,6 @@ from pathlib import Path
 import pandas as pd
 
 from engine.data_loader import load_csv
-from strategies.strategy import compression_breakout
 from engine.backtester import run
 from engine.metrics import compute_metrics, print_metrics, plot_results
 
@@ -35,6 +35,7 @@ log = logging.getLogger(__name__)
 # Configuration
 # ---------------------------------------------------------------------------
 DATA_FILE = "data/nq_15m_data.csv"
+STRATEGY_NAME = "strategy"
 
 BACKTEST_CONFIG = {
     "initial_capital": 100_000.0,
@@ -130,10 +131,22 @@ def main() -> None:
     n_bars = len(df)
     log.info("Loaded %s bars  |  %s  ->  %s", f"{n_bars:,}", df.index[0], df.index[-1])
 
-    # --- Generate signals ---
-    log.info("Running compression breakout strategy")
+    # --- Load strategy dynamically ---
+    log.info("Loading strategy: %s", STRATEGY_NAME)
     try:
-        signals = compression_breakout(df, **STRATEGY_CONFIG)
+        strategy_module = importlib.import_module(f"strategies.{STRATEGY_NAME}")
+    except ModuleNotFoundError:
+        log.error("Strategy module 'strategies/%s.py' not found.", STRATEGY_NAME)
+        sys.exit(1)
+
+    if not hasattr(strategy_module, "generate_signals"):
+        log.error("Strategy '%s' missing required generate_signals() function.", STRATEGY_NAME)
+        sys.exit(1)
+
+    # --- Generate signals ---
+    log.info("Running %s strategy", STRATEGY_NAME)
+    try:
+        signals = strategy_module.generate_signals(df, **STRATEGY_CONFIG)
     except Exception as exc:
         log.error("Strategy error: %s", exc)
         sys.exit(1)

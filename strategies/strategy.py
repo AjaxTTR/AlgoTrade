@@ -1,15 +1,19 @@
 """
-Strategy module.
+Compression Breakout strategy.
 
-Strategies are pure functions that receive an OHLCV DataFrame and return
-a signal Series: 1 (long), -1 (short), 0 (flat).
+Every strategy module in /strategies must expose:
+
+    def generate_signals(df: pd.DataFrame, **params) -> pd.DataFrame
+
+The returned DataFrame must include a ``signal`` column
+(1 = long, -1 = short, 0 = flat) and a ``stop_price`` column.
 """
 
 import pandas as pd
 import numpy as np
 
 
-def compression_breakout(
+def generate_signals(
     df: pd.DataFrame,
     atr_period: int = 14,
     compression_lookback: int = 12,
