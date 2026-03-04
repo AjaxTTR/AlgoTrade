@@ -17,6 +17,7 @@ def generate_signals(
     df: pd.DataFrame,
     orb_minutes: int = 30,
     session_start: str = "09:30",
+    session_end: str = "16:00",
     **kwargs,
 ) -> pd.DataFrame:
     """Opening Range Breakout strategy anchored to session open.
@@ -35,6 +36,9 @@ def generate_signals(
         Length of the opening range window in minutes (default 30).
     session_start : str
         Session open time in "HH:MM" format (default "09:30").
+    session_end : str
+        Session close time in "HH:MM" format (default "16:00").
+        Breakouts are only allowed before this time.
 
     Returns
     -------
@@ -48,8 +52,9 @@ def generate_signals(
     out = df.copy()
     n = len(out)
 
-    # Parse session start into hour and minute
+    # Parse session start and end into hour and minute
     ss_hour, ss_min = (int(x) for x in session_start.split(":"))
+    se_hour, se_min = (int(x) for x in session_end.split(":"))
 
     # Bar time components
     bar_times = out.index
@@ -57,19 +62,23 @@ def generate_signals(
     bar_minutes = bar_times.minute
     dates = bar_times.date
 
-    # Minutes since midnight for each bar and for session start
+    # Minutes since midnight for each bar, session boundaries, and ORB end
     bar_mins_since_midnight = bar_hours * 60 + bar_minutes
     session_start_mins = ss_hour * 60 + ss_min
-    session_end_mins = session_start_mins + orb_minutes
+    session_end_mins = se_hour * 60 + se_min
+    orb_end_mins = session_start_mins + orb_minutes
 
-    # ORB window: bars at or after session_start and before session_start + orb_minutes
+    # ORB window: bars at or after session_start and before ORB end
     is_orb_window = (
         (bar_mins_since_midnight >= session_start_mins)
-        & (bar_mins_since_midnight < session_end_mins)
+        & (bar_mins_since_midnight < orb_end_mins)
     )
 
-    # After ORB: bars at or after the ORB window closes
-    after_orb = bar_mins_since_midnight >= session_end_mins
+    # Tradeable window: after ORB closes and before session end
+    after_orb = (
+        (bar_mins_since_midnight >= orb_end_mins)
+        & (bar_mins_since_midnight < session_end_mins)
+    )
 
     # Compute opening range high/low per day using only ORB window bars
     orb_high = out["high"].where(is_orb_window)
