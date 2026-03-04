@@ -18,6 +18,8 @@ def generate_signals(
     orb_minutes: int = 30,
     session_start: str = "09:30",
     session_end: str = "16:00",
+    atr_period: int = 14,
+    tp_atr_multiple: float = 2.0,
     **kwargs,
 ) -> pd.DataFrame:
     """Opening Range Breakout strategy anchored to session open.
@@ -39,6 +41,10 @@ def generate_signals(
     session_end : str
         Session close time in "HH:MM" format (default "16:00").
         Breakouts are only allowed before this time.
+    atr_period : int
+        Lookback for ATR calculation (default 14).
+    tp_atr_multiple : float
+        ATR multiplier for take-profit distance (default 2.0).
 
     Returns
     -------
@@ -46,11 +52,24 @@ def generate_signals(
         Copy of input with added columns:
         - signal: 1 (long), -1 (short), 0 (flat)
         - stop_price: opposite boundary of the opening range
+        - tp_price: ATR-based take-profit target
         - range_high: opening range upper boundary
         - range_low: opening range lower boundary
+        - atr: Average True Range
     """
     out = df.copy()
     n = len(out)
+
+    # ── ATR (Wilder smoothing via EMA with alpha = 1/period) ──
+    tr = pd.concat(
+        [
+            out["high"] - out["low"],
+            (out["high"] - out["close"].shift(1)).abs(),
+            (out["low"] - out["close"].shift(1)).abs(),
+        ],
+        axis=1,
+    ).max(axis=1)
+    out["atr"] = tr.ewm(alpha=1.0 / atr_period, min_periods=atr_period, adjust=False).mean()
 
     # Parse session start and end into hour and minute
     ss_hour, ss_min = (int(x) for x in session_start.split(":"))
@@ -128,5 +147,13 @@ def generate_signals(
     stop_price[long_mask] = out["range_low"].values[long_mask]
     stop_price[short_mask] = out["range_high"].values[short_mask]
     out["stop_price"] = stop_price
+
+    # Take-profit: ATR-based target on signal bars only
+    tp_price = np.full(n, np.nan)
+    atr_vals = out["atr"].values
+    close_vals = out["close"].values
+    tp_price[long_mask] = close_vals[long_mask] + (atr_vals[long_mask] * tp_atr_multiple)
+    tp_price[short_mask] = close_vals[short_mask] - (atr_vals[short_mask] * tp_atr_multiple)
+    out["tp_price"] = tp_price
 
     return out
