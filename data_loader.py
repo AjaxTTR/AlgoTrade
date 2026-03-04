@@ -13,15 +13,17 @@ from pathlib import Path
 logger = logging.getLogger(__name__)
 
 
+_TIMESTAMP_ALIASES = ("timestamp", "time", "datetime", "ts_event", "date")
+
+
 def load_csv(
     filepath: str,
-    datetime_col: str = "timestamp",
     target_tz: str = "America/New_York",
 ) -> pd.DataFrame:
     """Load OHLCV data from CSV and return a clean, timezone-aware DataFrame.
 
     Processing pipeline:
-        1. Read CSV and parse timestamps
+        1. Read CSV and auto-detect the timestamp column
         2. Validate required columns exist
         3. Drop NaN OHLC rows
         4. Remove duplicate timestamps
@@ -33,8 +35,6 @@ def load_csv(
     ----------
     filepath : str
         Path to the CSV file.
-    datetime_col : str
-        Name of the column containing timestamps.
     target_tz : str
         IANA timezone to convert timestamps into (default: America/New_York).
 
@@ -42,34 +42,47 @@ def load_csv(
     -------
     pd.DataFrame
         DataFrame with columns: open, high, low, close, volume
-        and a DatetimeIndex in *target_tz*, sorted ascending.
+        and a DatetimeIndex named ``timestamp`` in *target_tz*, sorted ascending.
 
     Raises
     ------
     FileNotFoundError
         If the CSV file does not exist.
     ValueError
-        If required columns are missing or the file contains no valid rows.
+        If required columns are missing, no recognised timestamp column is
+        found, or the file contains no valid rows.
     """
     path = Path(filepath)
     if not path.exists():
         raise FileNotFoundError(f"Data file not found: {filepath}")
 
-    df = pd.read_csv(
-        filepath,
-        parse_dates=[datetime_col],
-        index_col=datetime_col,
-        dtype={
-            "open": np.float64,
-            "high": np.float64,
-            "low": np.float64,
-            "close": np.float64,
-            "volume": np.float64,
-        },
-    )
+    df = pd.read_csv(filepath)
 
     # Normalise column names to lowercase
     df.columns = df.columns.str.strip().str.lower()
+
+    # --- Auto-detect timestamp column ---
+    ts_col = None
+    for alias in _TIMESTAMP_ALIASES:
+        if alias in df.columns:
+            ts_col = alias
+            break
+
+    if ts_col is None:
+        raise ValueError(
+            f"No recognised timestamp column found. "
+            f"Expected one of: {_TIMESTAMP_ALIASES}. "
+            f"Got: {list(df.columns)}"
+        )
+
+    df[ts_col] = pd.to_datetime(df[ts_col])
+    df.rename(columns={ts_col: "timestamp"}, inplace=True)
+    df.set_index("timestamp", inplace=True)
+
+    # Cast OHLCV to float (handles mixed types after generic read)
+    for col in ("open", "high", "low", "close", "volume"):
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
 
     required = {"open", "high", "low", "close", "volume"}
     missing = required - set(df.columns)
