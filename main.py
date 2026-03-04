@@ -27,7 +27,8 @@ COMMISSION = 4.0             # Round-trip per contract
 ATR_PERIOD = 14
 COMPRESSION_LOOKBACK = 12
 COMPRESSION_RATIO = 0.75
-ATR_STOP_MULT = 1.5
+STOP_ATR_BUFFER = 0.5
+REQUIRE_CANDLE_CONFIRM = True
 
 
 def main() -> None:
@@ -48,7 +49,8 @@ def main() -> None:
         atr_period=ATR_PERIOD,
         compression_lookback=COMPRESSION_LOOKBACK,
         compression_ratio=COMPRESSION_RATIO,
-        atr_stop_mult=ATR_STOP_MULT,
+        stop_atr_buffer=STOP_ATR_BUFFER,
+        require_candle_confirm=REQUIRE_CANDLE_CONFIRM,
     )
 
     entry_count = (signals["signal"] != 0).sum()

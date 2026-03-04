@@ -14,13 +14,17 @@ def compression_breakout(
     atr_period: int = 14,
     compression_lookback: int = 12,
     compression_ratio: float = 0.75,
-    atr_stop_mult: float = 1.5,
+    stop_atr_buffer: float = 0.5,
+    require_candle_confirm: bool = True,
 ) -> pd.DataFrame:
     """Compression breakout strategy.
 
-    Detects periods where the recent price range contracts below a fraction
-    of ATR, then generates a long signal when price breaks above the
-    compression high.
+    Detects periods where volatility contracts (range < ATR * ratio AND ATR
+    declining over 3 bars), then generates entry signals when price breaks
+    out of the compression range with candle confirmation.
+
+    Only one signal per breakout move — a new entry requires the previous
+    bar's signal to have been flat (0).
 
     Parameters
     ----------
@@ -32,19 +36,24 @@ def compression_breakout(
         Number of bars to measure the compression range.
     compression_ratio : float
         Compression threshold — range must be below ATR * ratio.
-    atr_stop_mult : float
-        ATR multiplier for the initial stop-loss distance.
+    stop_atr_buffer : float
+        ATR multiplier added beyond the compression range for stop placement.
+        Long stop = range_low - ATR * buffer, Short stop = range_high + ATR * buffer.
+    require_candle_confirm : bool
+        If True, long entries require close > open (bullish candle) and
+        short entries require close < open (bearish candle).
 
     Returns
     -------
     pd.DataFrame
         Copy of input with added columns:
         - signal: 1 (long), -1 (short), 0 (flat)
-        - stop_price: ATR-based stop level (set on entry bar)
+        - stop_price: stop level anchored to compression range (set on entry bar)
     """
     out = df.copy()
+    n = len(out)
 
-    # --- ATR (Wilder smoothing via EMA with alpha = 1/period) ---
+    # ── ATR (Wilder smoothing: EMA with alpha = 1/period) ──
     tr = pd.concat(
         [
             out["high"] - out["low"],
@@ -55,35 +64,58 @@ def compression_breakout(
     ).max(axis=1)
     out["atr"] = tr.ewm(alpha=1.0 / atr_period, min_periods=atr_period, adjust=False).mean()
 
-    # --- Compression range (rolling high - low over lookback) ---
+    # ── Compression range (rolling high/low over lookback) ──
     out["range_high"] = out["high"].rolling(compression_lookback).max()
     out["range_low"] = out["low"].rolling(compression_lookback).min()
     out["range_width"] = out["range_high"] - out["range_low"]
 
-    # --- Compression condition ---
-    out["compressed"] = out["range_width"] < (out["atr"] * compression_ratio)
+    # ── Compression condition: tight range AND declining ATR ──
+    range_tight = out["range_width"] < (out["atr"] * compression_ratio)
+    atr_declining = (out["atr"] < out["atr"].shift(1)) & (out["atr"].shift(1) < out["atr"].shift(2))
+    out["compressed"] = range_tight & atr_declining
 
-    # --- Breakout signal: compressed on previous bar, close breaks above range high ---
-    # Use shifted compression state so we enter on the bar AFTER compression is detected
+    # ── Breakout detection ──
+    # Use previous bar's compression state and range levels so we enter
+    # on the bar AFTER compression is confirmed.
     was_compressed = out["compressed"].shift(1).fillna(False)
     prev_range_high = out["range_high"].shift(1)
     prev_range_low = out["range_low"].shift(1)
 
-    long_entry = was_compressed & (out["close"] > prev_range_high)
-    short_entry = was_compressed & (out["close"] < prev_range_low)
+    # Close must be outside the compression range
+    long_break = was_compressed & (out["close"] > prev_range_high)
+    short_break = was_compressed & (out["close"] < prev_range_low)
 
-    # --- Build signal series ---
-    out["signal"] = 0
-    out.loc[long_entry, "signal"] = 1
-    out.loc[short_entry, "signal"] = -1
+    # Optional candle confirmation: bullish candle for longs, bearish for shorts
+    if require_candle_confirm:
+        long_break = long_break & (out["close"] > out["open"])
+        short_break = short_break & (out["close"] < out["open"])
 
-    # --- Stop price (set on entry bars only, used by backtester) ---
-    out["stop_price"] = np.nan
-    out.loc[long_entry, "stop_price"] = out.loc[long_entry, "close"] - (
-        out.loc[long_entry, "atr"] * atr_stop_mult
-    )
-    out.loc[short_entry, "stop_price"] = out.loc[short_entry, "close"] + (
-        out.loc[short_entry, "atr"] * atr_stop_mult
-    )
+    # ── Build raw signal then suppress consecutive duplicates ──
+    raw_signal = np.zeros(n, dtype=np.int8)
+    raw_signal[long_break.values] = 1
+    raw_signal[short_break.values] = -1
+
+    # Only allow entry when previous signal was flat (prevent stacking)
+    signal = np.zeros(n, dtype=np.int8)
+    for i in range(1, n):
+        if raw_signal[i] != 0 and signal[i - 1] == 0:
+            signal[i] = raw_signal[i]
+
+    out["signal"] = signal
+
+    # ── Stop prices anchored to compression range ──
+    atr_vals = out["atr"].values
+    range_low_vals = prev_range_low.values
+    range_high_vals = prev_range_high.values
+
+    stop_price = np.full(n, np.nan)
+
+    long_mask = signal == 1
+    stop_price[long_mask] = range_low_vals[long_mask] - (atr_vals[long_mask] * stop_atr_buffer)
+
+    short_mask = signal == -1
+    stop_price[short_mask] = range_high_vals[short_mask] + (atr_vals[short_mask] * stop_atr_buffer)
+
+    out["stop_price"] = stop_price
 
     return out
