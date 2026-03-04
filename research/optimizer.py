@@ -1,8 +1,9 @@
 """
 Parameter optimizer for strategy modules.
 
-Runs a grid search over a parameter space, backtests each combination,
-and saves ranked results to research/results.csv.
+Runs a grid search over a parameter space, backtests each combination
+in parallel using multiprocessing, and saves ranked results to
+research/results.csv.
 
 Usage:
     python -m research.optimizer [strategy_name]
@@ -15,13 +16,10 @@ import itertools
 import logging
 import sys
 import time
+from multiprocessing import Pool, cpu_count
 from pathlib import Path
 
 import pandas as pd
-
-from engine.data_loader import load_csv
-from engine.backtester import run
-from engine.metrics import compute_metrics
 
 logging.basicConfig(
     level=logging.INFO,
@@ -67,11 +65,71 @@ def _build_combos(grid: dict) -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
+# Worker function (runs in child process)
+# ---------------------------------------------------------------------------
+
+def _evaluate_combo(args: tuple) -> dict:
+    """Evaluate a single parameter combination.
+
+    Each worker loads its own copy of data and strategy module to avoid
+    shared-state issues across processes.
+
+    Parameters
+    ----------
+    args : tuple
+        (params, strategy_name, data_file) where params is a dict of
+        strategy parameters.
+
+    Returns
+    -------
+    dict
+        Result row with parameters, strategy name, and performance metrics.
+    """
+    params, strategy_name, data_file = args
+
+    from engine.data_loader import load_csv
+    from engine.backtester import run
+    from engine.metrics import compute_metrics
+
+    try:
+        df = load_csv(data_file)
+        strategy_module = importlib.import_module(f"strategies.{strategy_name}")
+        signals = strategy_module.generate_signals(df.copy(), **params)
+        bt_result = run(signals, **BACKTEST_CONFIG)
+        metrics = compute_metrics(bt_result, initial_capital=BACKTEST_CONFIG["initial_capital"])
+
+        mtm = metrics["mtm"]
+        trades = metrics["trades"]
+
+        return {
+            "strategy_name": strategy_name,
+            **params,
+            "total_return": mtm["total_return"],
+            "sharpe": mtm["sharpe"],
+            "max_drawdown": mtm["max_drawdown"],
+            "profit_factor": trades["profit_factor"],
+            "trades": trades["total_trades"],
+        }
+
+    except Exception as exc:
+        return {
+            "strategy_name": strategy_name,
+            **params,
+            "total_return": None,
+            "sharpe": None,
+            "max_drawdown": None,
+            "profit_factor": None,
+            "trades": 0,
+            "error": str(exc),
+        }
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
 def optimize(strategy_name: str = "strategy") -> pd.DataFrame:
-    """Run grid search and return a DataFrame of results.
+    """Run grid search in parallel and return a DataFrame of results.
 
     Parameters
     ----------
@@ -80,67 +138,44 @@ def optimize(strategy_name: str = "strategy") -> pd.DataFrame:
     """
     t_start = time.perf_counter()
 
-    # Load data once
-    log.info("Loading data from %s", DATA_FILE)
-    try:
-        df = load_csv(DATA_FILE)
-    except (FileNotFoundError, ValueError) as exc:
-        log.error("Data load failed: %s", exc)
+    # Validate data file exists before spawning workers
+    if not Path(DATA_FILE).exists():
+        log.error("Data file not found: %s", DATA_FILE)
         sys.exit(1)
-    log.info("Loaded %s bars", f"{len(df):,}")
 
-    # Load strategy module once
-    log.info("Loading strategy: %s", strategy_name)
+    # Validate strategy module exists
     try:
-        strategy_module = importlib.import_module(f"strategies.{strategy_name}")
+        mod = importlib.import_module(f"strategies.{strategy_name}")
     except ModuleNotFoundError:
         log.error("Strategy module 'strategies/%s.py' not found.", strategy_name)
         sys.exit(1)
-
-    if not hasattr(strategy_module, "generate_signals"):
+    if not hasattr(mod, "generate_signals"):
         log.error("Strategy '%s' missing generate_signals().", strategy_name)
         sys.exit(1)
 
     # Build parameter combinations
     combos = _build_combos(PARAM_GRID)
     total = len(combos)
-    log.info("Parameter combinations: %d", total)
+    n_workers = cpu_count()
+    log.info("Parameter combinations: %d  |  Workers: %d", total, n_workers)
 
-    results: list[dict] = []
+    # Build args list for pool.map
+    args_list = [(params, strategy_name, DATA_FILE) for params in combos]
 
-    for i, params in enumerate(combos, 1):
-        try:
-            signals = strategy_module.generate_signals(df.copy(), **params)
-            bt_result = run(signals, **BACKTEST_CONFIG)
-            metrics = compute_metrics(bt_result, initial_capital=BACKTEST_CONFIG["initial_capital"])
+    # Run in parallel
+    with Pool(n_workers) as pool:
+        results = pool.map(_evaluate_combo, args_list)
 
-            mtm = metrics["mtm"]
-            trades = metrics["trades"]
+    # Log any failures
+    failures = [r for r in results if r.get("error")]
+    if failures:
+        log.warning("%d / %d combinations failed", len(failures), total)
+        for f in failures:
+            log.warning("  %s: %s", {k: v for k, v in f.items() if k in PARAM_GRID}, f["error"])
 
-            results.append({
-                "strategy_name": strategy_name,
-                **params,
-                "total_return": mtm["total_return"],
-                "sharpe": mtm["sharpe"],
-                "max_drawdown": mtm["max_drawdown"],
-                "profit_factor": trades["profit_factor"],
-                "trades": trades["total_trades"],
-            })
-
-        except Exception as exc:
-            log.warning("Combo %d/%d failed (%s): %s", i, total, params, exc)
-            results.append({
-                "strategy_name": strategy_name,
-                **params,
-                "total_return": None,
-                "sharpe": None,
-                "max_drawdown": None,
-                "profit_factor": None,
-                "trades": 0,
-            })
-
-        if i % 10 == 0 or i == total:
-            log.info("Progress: %d / %d", i, total)
+    # Clean error key before building DataFrame
+    for r in results:
+        r.pop("error", None)
 
     # Build DataFrame and sort by Sharpe
     results_df = pd.DataFrame(results)
@@ -163,7 +198,7 @@ def optimize(strategy_name: str = "strategy") -> pd.DataFrame:
     ]
     print(results_df[display_cols].head(TOP_N).to_string(index=True))
     print("=" * 90)
-    print(f"  Total combinations: {total}  |  Runtime: {elapsed:.1f}s")
+    print(f"  Total combinations: {total}  |  Workers: {n_workers}  |  Runtime: {elapsed:.1f}s")
     print("=" * 90 + "\n")
 
     return results_df
