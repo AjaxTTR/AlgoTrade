@@ -92,6 +92,10 @@ def run(
     has_tp = "tp_price" in signals.columns
     tps = signals["tp_price"].values if has_tp else np.full(len(closes), np.nan)
 
+    # session_close is optional — fill with False if column is absent
+    has_session_close = "session_close" in signals.columns
+    session_closes = signals["session_close"].values if has_session_close else np.zeros(len(closes), dtype=bool)
+
     timestamps = signals.index
 
     n = len(closes)
@@ -155,6 +159,16 @@ def run(
                     fill_price += slippage_points
                     exited = True
                     exit_reason = "target"
+
+            # Session close exit — checked after stop and TP
+            if not exited and session_closes[i]:
+                fill_price = closes[i]
+                if pos_dir == 1:
+                    fill_price -= slippage_points
+                else:
+                    fill_price += slippage_points
+                exited = True
+                exit_reason = "session_close"
 
             if exited:
                 gross_pnl = pos_dir * (fill_price - entry_price) * pos_size * point_value
