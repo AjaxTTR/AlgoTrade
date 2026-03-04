@@ -46,10 +46,10 @@ BACKTEST_CONFIG = {
 
 STRATEGY_CONFIG = {
     "atr_period": 14,
-    "compression_lookback": 12,
-    "compression_ratio": 0.75,
-    "stop_atr_buffer": 0.5,
-    "require_candle_confirm": True,
+    "compression_lookback": 8,
+    "compression_ratio": 1.2,
+    "stop_atr_buffer": 1.0,
+    "require_candle_confirm": False,
 }
 
 OUTPUT_DIR = Path(".")
