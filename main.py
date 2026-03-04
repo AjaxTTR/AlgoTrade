@@ -18,10 +18,10 @@ from pathlib import Path
 
 import pandas as pd
 
-from data_loader import load_csv
-from strategy import compression_breakout
-from backtester import run
-from metrics import compute_metrics, print_metrics, plot_results
+from engine.data_loader import load_csv
+from strategies.strategy import compression_breakout
+from engine.backtester import run
+from engine.metrics import compute_metrics, print_metrics, plot_results
 
 logging.basicConfig(
     level=logging.INFO,
@@ -34,7 +34,7 @@ log = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
-DATA_FILE = "nq_15m_data.csv"
+DATA_FILE = "data/nq_15m_data.csv"
 
 BACKTEST_CONFIG = {
     "initial_capital": 100_000.0,

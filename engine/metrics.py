@@ -9,7 +9,7 @@ vectorised via NumPy/Pandas.
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
-from backtester import BacktestResult
+from engine.backtester import BacktestResult
 
 # Small constant to prevent division-by-zero
 _EPS = 1e-9
