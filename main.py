@@ -19,9 +19,10 @@ from metrics import compute_metrics, print_metrics, plot_results
 # ---------------------------------------------------------------------------
 DATA_FILE = "nq_15m_data.csv"
 INITIAL_CAPITAL = 100_000.0
-RISK_PCT = 0.5              # Risk 0.5% of equity per trade
+RISK_PER_TRADE = 0.005       # 0.5% of equity per trade (decimal)
 POINT_VALUE = 20.0           # NQ futures: $20 per point
-COMMISSION = 4.0             # Round-trip per contract
+COMMISSION_PER_SIDE = 2.0    # Commission per contract per side
+SLIPPAGE_POINTS = 0.25       # Slippage in price points per fill
 
 # Strategy parameters
 ATR_PERIOD = 14
@@ -61,9 +62,10 @@ def main() -> None:
     result = run(
         signals,
         initial_capital=INITIAL_CAPITAL,
-        risk_pct=RISK_PCT,
+        risk_per_trade=RISK_PER_TRADE,
         point_value=POINT_VALUE,
-        commission_per_contract=COMMISSION,
+        commission_per_side=COMMISSION_PER_SIDE,
+        slippage_points=SLIPPAGE_POINTS,
     )
 
     # --- Metrics ---

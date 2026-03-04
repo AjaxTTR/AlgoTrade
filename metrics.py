@@ -31,7 +31,7 @@ def compute_metrics(result: BacktestResult, initial_capital: float = 100_000.0) 
         Keys: total_return, cagr, max_drawdown, sharpe, win_rate,
         profit_factor, total_trades, avg_trade.
     """
-    equity = result.equity_curve
+    equity = result.equity_mtm
     trades = result.trades
 
     # --- Total return ---
@@ -122,11 +122,13 @@ def plot_results(result: BacktestResult, metrics: dict) -> None:
         fontweight="bold",
     )
 
-    # --- Equity curve ---
+    # --- Equity curves (MTM and closed-trade) ---
     ax1 = axes[0]
-    ax1.plot(result.equity_curve.index, result.equity_curve.values, linewidth=1, color="#2196F3")
+    ax1.plot(result.equity_mtm.index, result.equity_mtm.values, linewidth=1, color="#2196F3", label="Mark-to-Market")
+    ax1.plot(result.equity_closed.index, result.equity_closed.values, linewidth=1, color="#FF9800", alpha=0.7, label="Closed-Trade")
     ax1.set_title("Equity Curve", fontsize=11)
     ax1.set_ylabel("Equity ($)")
+    ax1.legend(fontsize=9)
     ax1.grid(True, alpha=0.3)
 
     # --- Drawdown ---
