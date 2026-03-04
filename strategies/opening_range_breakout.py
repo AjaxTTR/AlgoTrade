@@ -18,6 +18,7 @@ def generate_signals(
     orb_minutes: int = 30,
     session_start: str = "09:30",
     session_end: str = "16:00",
+    entry_cutoff: str = "14:30",
     atr_period: int = 14,
     tp_atr_multiple: float = 2.0,
     **kwargs,
@@ -41,6 +42,9 @@ def generate_signals(
     session_end : str
         Session close time in "HH:MM" format (default "16:00").
         Breakouts are only allowed before this time.
+    entry_cutoff : str
+        Latest time for new entries in "HH:MM" format (default "14:30").
+        No new breakout signals after this time.
     atr_period : int
         Lookback for ATR calculation (default 14).
     tp_atr_multiple : float
@@ -72,9 +76,10 @@ def generate_signals(
     ).max(axis=1)
     out["atr"] = tr.ewm(alpha=1.0 / atr_period, min_periods=atr_period, adjust=False).mean()
 
-    # Parse session start and end into hour and minute
+    # Parse session start, end, and entry cutoff into hour and minute
     ss_hour, ss_min = (int(x) for x in session_start.split(":"))
     se_hour, se_min = (int(x) for x in session_end.split(":"))
+    ec_hour, ec_min = (int(x) for x in entry_cutoff.split(":"))
 
     # Bar time components
     bar_times = out.index
@@ -86,6 +91,7 @@ def generate_signals(
     bar_mins_since_midnight = bar_hours * 60 + bar_minutes
     session_start_mins = ss_hour * 60 + ss_min
     session_end_mins = se_hour * 60 + se_min
+    entry_cutoff_mins = ec_hour * 60 + ec_min
     orb_end_mins = session_start_mins + orb_minutes
 
     # ORB window: bars at or after session_start and before ORB end
@@ -94,9 +100,10 @@ def generate_signals(
         & (bar_mins_since_midnight < orb_end_mins)
     )
 
-    # Tradeable window: after ORB closes and before session end
+    # Tradeable window: after ORB closes, before entry cutoff, and before session end
     after_orb = (
         (bar_mins_since_midnight >= orb_end_mins)
+        & (bar_mins_since_midnight < entry_cutoff_mins)
         & (bar_mins_since_midnight < session_end_mins)
     )
 
