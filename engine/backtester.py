@@ -2,8 +2,8 @@
 Backtesting engine for futures strategies.
 
 Simulates trade execution from a signal DataFrame produced by a strategy
-function.  Models next-bar-open fills, gap-aware stop-loss, per-side
-commissions, slippage, and proper position sizing.
+function.  Models next-bar-open fills, gap-aware stop-loss and take-profit,
+per-side commissions, slippage, and proper position sizing.
 """
 
 import math
@@ -23,6 +23,7 @@ class TradeRecord:
     size: int               # number of contracts
     pnl: float
     return_pct: float
+    exit_reason: str        # "stop", "target", "final_bar"
 
 
 @dataclass
@@ -48,7 +49,9 @@ def run(
     Execution model
     ---------------
     - Signals fire on bar *i*; entry fills at bar *i+1* open.
-    - Stop-loss fills at the worse of stop price or bar open (gap model).
+    - Stop-loss is checked first each bar (priority over take-profit).
+    - Take-profit is checked only if the stop was not hit.
+    - Both stop and TP fill at the worse of target price or bar open (gap model).
     - Commission is charged per side (entry and exit separately).
     - Slippage is applied against the trade on both entry and exit.
 
@@ -56,8 +59,10 @@ def run(
     ----------
     signals : pd.DataFrame
         Must contain columns: open, high, low, close, signal, stop_price.
+        Optionally contains: tp_price (take-profit level; NaN to disable).
         ``signal``: 1 (long), -1 (short), 0 (flat).
         ``stop_price``: initial stop for the trade (NaN when no signal).
+        ``tp_price``: take-profit target (NaN to skip TP logic).
     initial_capital : float
         Starting account equity in USD.
     risk_per_trade : float
@@ -82,6 +87,11 @@ def run(
     opens = signals["open"].values
     sigs = signals["signal"].values.astype(np.int8)
     stops = signals["stop_price"].values
+
+    # tp_price is optional — fill with NaN if column is absent
+    has_tp = "tp_price" in signals.columns
+    tps = signals["tp_price"].values if has_tp else np.full(len(closes), np.nan)
+
     timestamps = signals.index
 
     n = len(closes)
@@ -95,11 +105,13 @@ def run(
     pos_size = 0            # contracts (int)
     entry_price = 0.0
     stop_price = np.nan
+    tp_price = np.nan
     entry_idx = 0
 
     # Pending entry from previous bar's signal
     pending_signal = 0      # direction of pending entry
     pending_stop = np.nan   # stop price for pending entry
+    pending_tp = np.nan     # take-profit price for pending entry
 
     closed_equity = initial_capital  # running closed-trade equity
     prev_mtm = 0.0                  # previous bar's open-position MTM value
@@ -109,23 +121,42 @@ def run(
     for i in range(1, n):
         bar_cash_flow = 0.0   # realised cash changes this bar
 
-        # ── 1. Check stop-loss on open position ──
+        # ── 1. Check exits on open position ──
         if pos_dir != 0:
-            stopped = False
+            exited = False
             fill_price = np.nan
+            exit_reason = ""
 
+            # Stop-loss checked FIRST (priority over take-profit)
             if pos_dir == 1 and lows[i] <= stop_price:
                 # Long stop hit — fill at worse of stop or open (gap down)
                 fill_price = min(stop_price, opens[i])
-                fill_price -= slippage_points  # slippage worsens long exit
-                stopped = True
+                fill_price -= slippage_points
+                exited = True
+                exit_reason = "stop"
             elif pos_dir == -1 and highs[i] >= stop_price:
                 # Short stop hit — fill at worse of stop or open (gap up)
                 fill_price = max(stop_price, opens[i])
-                fill_price += slippage_points  # slippage worsens short exit
-                stopped = True
+                fill_price += slippage_points
+                exited = True
+                exit_reason = "stop"
 
-            if stopped:
+            # Take-profit checked only if stop was not hit
+            if not exited and not np.isnan(tp_price):
+                if pos_dir == 1 and highs[i] >= tp_price:
+                    # Long TP hit — fill at better of TP or open (gap up)
+                    fill_price = max(tp_price, opens[i])
+                    fill_price -= slippage_points
+                    exited = True
+                    exit_reason = "target"
+                elif pos_dir == -1 and lows[i] <= tp_price:
+                    # Short TP hit — fill at better of TP or open (gap down)
+                    fill_price = min(tp_price, opens[i])
+                    fill_price += slippage_points
+                    exited = True
+                    exit_reason = "target"
+
+            if exited:
                 gross_pnl = pos_dir * (fill_price - entry_price) * pos_size * point_value
                 exit_commission = commission_per_side * pos_size
                 net_pnl = gross_pnl - exit_commission
@@ -143,6 +174,7 @@ def run(
                     size=pos_size,
                     pnl=net_pnl,
                     return_pct=net_pnl / equity_mtm[i - 1] * 100 if equity_mtm[i - 1] != 0 else 0.0,
+                    exit_reason=exit_reason,
                 ))
                 pos_dir = 0
                 pos_size = 0
@@ -151,6 +183,7 @@ def run(
         if pos_dir == 0 and pending_signal != 0:
             sig = pending_signal
             stop_val = pending_stop
+            tp_val = pending_tp
 
             # Apply slippage adversely to entry
             fill_price = opens[i] + slippage_points if sig == 1 else opens[i] - slippage_points
@@ -167,17 +200,20 @@ def run(
 
                     entry_price = fill_price
                     stop_price = stop_val
+                    tp_price = tp_val
                     pos_dir = sig
                     pos_size = contracts
                     entry_idx = i
 
             pending_signal = 0
             pending_stop = np.nan
+            pending_tp = np.nan
 
         # ── 3. Register new signal for next-bar fill ──
         if pos_dir == 0 and sigs[i] != 0 and not np.isnan(stops[i]):
             pending_signal = sigs[i]
             pending_stop = stops[i]
+            pending_tp = tps[i]
 
         # ── 4. Mark-to-market ──
         current_mtm = 0.0
@@ -211,6 +247,7 @@ def run(
             size=pos_size,
             pnl=net_pnl,
             return_pct=net_pnl / equity_mtm[-2] * 100 if equity_mtm[-2] != 0 else 0.0,
+            exit_reason="final_bar",
         ))
         equity_closed[-1] = closed_equity
 
