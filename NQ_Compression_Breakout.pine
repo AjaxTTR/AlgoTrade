@@ -1,0 +1,439 @@
+// ============================================================================
+// NQ Compression Breakout Strategy v1.0
+// ============================================================================
+// Instrument:  NQ1! continuous futures
+// Timeframe:   15-minute chart ONLY
+// Description: Detects volatility compression phases, then trades breakouts
+//              with asymmetric sizing based on 4H trend direction.
+//              Includes partial profit-taking, ATR trailing stops, and
+//              daily/weekly risk controls.
+// ============================================================================
+
+//@version=5
+strategy("NQ Compression Breakout",
+     overlay        = true,
+     pyramiding     = 0,
+     commission_type = strategy.commission.percent,
+     commission_value = 0.02,
+     slippage       = 1,
+     calc_on_every_tick = false,
+     default_qty_type   = strategy.fixed,
+     default_qty_value  = 1,
+     currency       = currency.USD,
+     initial_capital = 100000)
+
+// ============================================================================
+// INPUTS
+// ============================================================================
+
+// --- Higher Timeframe Trend Filter ---
+i_htfEmaLen     = input.int(200, "HTF EMA Length", minval=1)
+
+// --- Compression Detection ---
+i_atrLen        = input.int(14,  "ATR Length", minval=1)
+i_atrSmaLen     = input.int(100, "ATR SMA Length (compression baseline)", minval=1)
+i_compressRatio = input.float(0.85, "Compression Ratio (ATR < SMA * ratio)", minval=0.1, maxval=1.0, step=0.05)
+i_compressLookback = input.int(12, "Compression Range Lookback (bars)", minval=1)
+
+// --- Session Filter ---
+i_session       = input.session("0930-1600", "US Session (New York)")
+
+// --- Breakout ---
+i_maxAttempts   = input.int(2, "Max Breakout Attempts Per Compression", minval=1)
+
+// --- Position Sizing ---
+i_baseRisk      = input.float(0.5, "Base Risk % of Equity", minval=0.01, maxval=5.0, step=0.05)
+
+// --- Trade Management ---
+i_partialRMultiple = input.float(2.0, "Partial TP at R-multiple", minval=0.5, step=0.5)
+i_partialPct       = input.float(50.0, "Partial Close %", minval=10.0, maxval=90.0, step=5.0)
+i_trailAtrLen      = input.int(14, "Trailing Stop ATR Length", minval=1)
+i_trailAtrMult     = input.float(1.5, "Trailing Stop ATR Multiplier", minval=0.5, step=0.1)
+
+// --- Risk Controls ---
+i_maxLossPerDay    = input.int(2, "Max Losing Trades Per Day", minval=1)
+i_dailyLossLimit   = input.float(-2.0, "Daily Loss Limit (%)", maxval=0.0, step=0.1)
+i_weeklyDDLimit    = input.float(-4.0, "Weekly Drawdown Pause (%)", maxval=0.0, step=0.1)
+
+// ============================================================================
+// 1️⃣ HIGHER TIMEFRAME TREND FILTER (4H)
+// ============================================================================
+// We request the 4H EMA and 4H close separately to avoid repainting.
+// lookahead = barmerge.lookahead_off ensures we use the confirmed (closed)
+// 4H bar value, not a future one. barmerge.gaps_off fills forward so we
+// always have a value on every 15m bar.
+// ============================================================================
+
+ema_4h   = request.security(syminfo.tickerid, "240", ta.ema(close, i_htfEmaLen), lookahead = barmerge.lookahead_off, gaps = barmerge.gaps_off)
+close_4h = request.security(syminfo.tickerid, "240", close,                      lookahead = barmerge.lookahead_off, gaps = barmerge.gaps_off)
+
+trendUp   = close_4h > ema_4h   // Bullish bias on 4H
+trendDown = close_4h < ema_4h   // Bearish bias on 4H
+
+// Plot the 4H EMA for visual reference
+plot(ema_4h, "4H EMA 200", color=color.new(color.orange, 30), linewidth=2)
+
+// ============================================================================
+// 2️⃣ COMPRESSION DETECTION (15m)
+// ============================================================================
+// Compression = current ATR(14) is less than 70% of the 100-bar SMA of ATR(14).
+// This indicates that volatility has contracted significantly relative to its
+// recent average — a coiled spring ready to expand.
+//
+// We track compression phase state with a var variable so we know when a new
+// compression phase begins (to reset the attempt counter) and when it ends.
+// ============================================================================
+
+atr14           = ta.atr(i_atrLen)
+atrSma          = ta.sma(atr14, i_atrSmaLen)
+compressionCond = atr14 < atrSma * i_compressRatio
+
+// Track compression phase state
+var bool compressionActive    = false
+var bool prevCompressionState = false
+var int  attemptCount         = 0
+
+prevCompressionState := compressionActive
+
+// ============================================================================
+// 3️⃣ COMPRESSION RANGE (15m) — Static Box
+// ============================================================================
+// When compression turns ON, capture the highest high and lowest low over the
+// lookback window and store them. These levels remain FIXED for the entire
+// compression phase — they do NOT roll forward bar-by-bar.
+// When compression turns OFF, reset the stored levels.
+// ============================================================================
+
+var float compressionHigh = na
+var float compressionLow  = na
+
+// Compression turns ON — lock the range
+if compressionCond and not compressionActive
+    compressionActive := true
+    attemptCount      := 0
+    compressionHigh   := ta.highest(high, i_compressLookback)
+    compressionLow    := ta.lowest(low, i_compressLookback)
+
+// Compression turns OFF — reset everything
+if not compressionCond and compressionActive
+    compressionActive := false
+    attemptCount      := 0
+    compressionHigh   := na
+    compressionLow    := na
+
+// Plot compression range when active (static horizontal levels)
+plot(compressionActive ? compressionHigh : na, "Compression High", color=color.new(color.green, 40), style=plot.style_stepline)
+plot(compressionActive ? compressionLow  : na, "Compression Low",  color=color.new(color.red, 40),   style=plot.style_stepline)
+
+// Background highlight during compression
+bgcolor(compressionActive ? color.new(color.blue, 92) : na, title="Compression Zone")
+
+// ============================================================================
+// 4️⃣ SESSION FILTER
+// ============================================================================
+// Only allow entries during the US cash session (09:30–16:00 New York).
+// Trades may remain open outside this window — we only restrict entries.
+// ============================================================================
+
+inSession = not na(time(timeframe.period, i_session, "America/New_York"))
+
+// ============================================================================
+// 8️⃣ RISK CONTROLS (evaluated before entry logic)
+// ============================================================================
+// - Max N losing trades per calendar day
+// - Daily loss limit as % of equity at start of day
+// - Weekly drawdown pause at % of equity at start of week
+//
+// We track these manually with var variables, resetting at the appropriate
+// boundaries (new day / new week) detected via date changes.
+// ============================================================================
+
+// --- Daily tracking ---
+var int   dailyLossCount   = 0
+var float dailyStartEquity = strategy.equity
+var int   lastTradeDay     = -1
+var int   lastTradeCount   = 0
+
+// Detect new calendar day (precise daily boundary detection)
+newDay = ta.change(time("D")) != 0
+
+if newDay
+    dailyLossCount   := 0
+    dailyStartEquity := strategy.equity
+
+// Track closed trades to detect new losses
+if strategy.closedtrades > lastTradeCount
+    // Check each newly closed trade
+    for i = lastTradeCount to strategy.closedtrades - 1
+        if strategy.closedtrades.profit(i) < 0
+            dailyLossCount += 1
+    lastTradeCount := strategy.closedtrades
+
+dailyPnlPct      = ((strategy.equity - dailyStartEquity) / dailyStartEquity) * 100.0
+dailyLossLimitHit = dailyPnlPct <= i_dailyLossLimit
+dailyMaxLossesHit = dailyLossCount >= i_maxLossPerDay
+
+// --- Weekly tracking ---
+var float weeklyStartEquity = strategy.equity
+var int   lastWeekNum       = -1
+
+currentWeek = weekofyear(time)
+newWeek     = ta.change(currentWeek) != 0
+
+if newWeek
+    weeklyStartEquity := strategy.equity
+
+weeklyPnlPct      = ((strategy.equity - weeklyStartEquity) / weeklyStartEquity) * 100.0
+weeklyDDLimitHit  = weeklyPnlPct <= i_weeklyDDLimit
+
+// Combined risk gate — if any limit is hit, no new entries allowed
+riskAllowEntry = not dailyLossLimitHit and not dailyMaxLossesHit and not weeklyDDLimitHit
+
+// ============================================================================
+// 5️⃣ BREAKOUT ENTRY LOGIC
+// ============================================================================
+// A breakout occurs when price closes above the compression high (long) or
+// below the compression low (short) while compression is still active.
+// Maximum 2 attempts per compression phase.
+// Entry is at market on the next bar (strategy.entry executes on next bar open).
+// ============================================================================
+
+breakoutLong  = compressionActive and close > compressionHigh and inSession and attemptCount < i_maxAttempts and riskAllowEntry
+breakoutShort = compressionActive and close < compressionLow  and inSession and attemptCount < i_maxAttempts and riskAllowEntry
+
+// ============================================================================
+// 6️⃣ ASYMMETRIC POSITION SIZING
+// ============================================================================
+// Risk per trade depends on trend direction:
+//   trendUp:   Long = base risk (0.5%), Short = half (0.25%)
+//   trendDown: Short = base risk (0.5%), Long = half (0.25%)
+//   Neither:   both = half (0.25%)
+//
+// Position size = riskAmount / stopDistance
+// Stop distance = distance from entry to the opposite compression boundary.
+// Sizing uses close as an estimate; actual entry price is captured on fill
+// via strategy.position_avg_price and R-value is recalculated precisely.
+// ============================================================================
+
+// Determine risk percentage for longs and shorts
+longRiskPct  = trendUp ? i_baseRisk / 100.0 : i_baseRisk / 200.0
+shortRiskPct = trendDown ? i_baseRisk / 100.0 : i_baseRisk / 200.0
+
+// ============================================================================
+// 7️⃣ STOP & TRADE MANAGEMENT — State Variables
+// ============================================================================
+// We track per-trade state with var variables:
+//   - Entry price (set from strategy.position_avg_price on fill detection)
+//   - Initial stop, R value, whether partial has been taken
+//   - Trailing stop level (updated every bar after partial)
+// ============================================================================
+
+var float entryPrice       = na
+var float initialStop      = na
+var float rValue           = na
+var bool  partialTaken     = false
+var float trailingStop     = na
+var int   tradeDirection   = 0    // 1 = long, -1 = short, 0 = flat
+var float currentStop      = na
+var float pendingStop      = na   // Stores intended stop from signal bar until fill
+var bool  entryConfirmed   = false // Whether actual fill price has been captured
+
+// ATR for trailing stop (calculated every bar)
+trailATR = ta.atr(i_trailAtrLen)
+
+// ============================================================================
+// ENTRY EXECUTION
+// ============================================================================
+
+if breakoutLong and strategy.position_size == 0
+    // Calculate stop distance using close as estimate for sizing only
+    stopDist  = math.abs(close - compressionLow)
+    if stopDist > 0
+        riskAmt  = strategy.equity * longRiskPct
+        posSize  = math.floor(riskAmt / stopDist)
+
+        // Skip trade if risk-appropriate size is less than 1 contract
+        if posSize >= 1
+            strategy.entry("Long", strategy.long, qty=posSize)
+
+            // Store pending state — actual entry price captured on fill detection
+            pendingStop    := compressionLow
+            partialTaken   := false
+            trailingStop   := na
+            tradeDirection := 1
+            entryConfirmed := false
+            attemptCount   += 1
+
+if breakoutShort and strategy.position_size == 0
+    // Calculate stop distance using close as estimate for sizing only
+    stopDist  = math.abs(compressionHigh - close)
+    if stopDist > 0
+        riskAmt  = strategy.equity * shortRiskPct
+        posSize  = math.floor(riskAmt / stopDist)
+
+        // Skip trade if risk-appropriate size is less than 1 contract
+        if posSize >= 1
+            strategy.entry("Short", strategy.short, qty=posSize)
+
+            // Store pending state — actual entry price captured on fill detection
+            pendingStop    := compressionHigh
+            partialTaken   := false
+            trailingStop   := na
+            tradeDirection := -1
+            entryConfirmed := false
+            attemptCount   += 1
+
+// ============================================================================
+// FILL DETECTION — Capture actual entry price from strategy.position_avg_price
+// ============================================================================
+// On the bar where position becomes active (was flat previous bar, now filled),
+// set entryPrice to the real fill price and recalculate rValue, initialStop,
+// and currentStop based on the actual entry — not the signal bar close.
+// ============================================================================
+
+if strategy.position_size != 0 and strategy.position_size[1] == 0 and not entryConfirmed
+    entryPrice     := strategy.position_avg_price
+    initialStop    := pendingStop
+    entryConfirmed := true
+
+    if tradeDirection == 1
+        // Long: stop is below at pendingStop (compressionLow from signal bar)
+        rValue      := math.abs(entryPrice - pendingStop)
+        currentStop := pendingStop
+    else if tradeDirection == -1
+        // Short: stop is above at pendingStop (compressionHigh from signal bar)
+        rValue      := math.abs(pendingStop - entryPrice)
+        currentStop := pendingStop
+
+// ============================================================================
+// 7️⃣ STOP & TRADE MANAGEMENT — Ongoing Management
+// ============================================================================
+// Each bar while in a position:
+//   1. Check if +2R has been reached → partial close 50%, move stop to breakeven
+//   2. After partial, update ATR trailing stop every bar
+//   3. Apply the tightest (most protective) stop
+// ============================================================================
+
+if strategy.position_size != 0 and entryConfirmed
+
+    // --- LONG POSITION MANAGEMENT ---
+    if tradeDirection == 1
+        unrealizedR = (close - entryPrice) / rValue
+
+        // Partial take profit at +2R
+        if not partialTaken and unrealizedR >= i_partialRMultiple
+            // Close 50% of position
+            closeQty = math.floor(math.abs(strategy.position_size) * (i_partialPct / 100.0))
+            closeQty := math.max(closeQty, 1)
+            strategy.close("Long", qty=closeQty, comment="Partial +2R")
+
+            // Move stop to breakeven
+            currentStop  := entryPrice
+            partialTaken := true
+
+            // Initialize trailing stop
+            trailingStop := close - (trailATR * i_trailAtrMult)
+
+        // Update trailing stop every bar after partial taken
+        if partialTaken
+            newTrail = close - (trailATR * i_trailAtrMult)
+            // Trail only moves up for longs, never down
+            if not na(trailingStop)
+                trailingStop := math.max(trailingStop, newTrail)
+            else
+                trailingStop := newTrail
+
+            // Use the higher of breakeven and trailing stop
+            currentStop := math.max(entryPrice, trailingStop)
+
+        // Apply stop loss
+        strategy.exit("Long SL", "Long", stop=currentStop)
+
+    // --- SHORT POSITION MANAGEMENT ---
+    if tradeDirection == -1
+        unrealizedR = (entryPrice - close) / rValue
+
+        // Partial take profit at +2R
+        if not partialTaken and unrealizedR >= i_partialRMultiple
+            closeQty = math.floor(math.abs(strategy.position_size) * (i_partialPct / 100.0))
+            closeQty := math.max(closeQty, 1)
+            strategy.close("Short", qty=closeQty, comment="Partial +2R")
+
+            currentStop  := entryPrice
+            partialTaken := true
+
+            trailingStop := close + (trailATR * i_trailAtrMult)
+
+        if partialTaken
+            newTrail = close + (trailATR * i_trailAtrMult)
+            // Trail only moves down for shorts, never up
+            if not na(trailingStop)
+                trailingStop := math.min(trailingStop, newTrail)
+            else
+                trailingStop := newTrail
+
+            // Use the lower of breakeven and trailing stop
+            currentStop := math.min(entryPrice, trailingStop)
+
+        strategy.exit("Short SL", "Short", stop=currentStop)
+
+// Reset trade state when flat
+if strategy.position_size == 0 and tradeDirection != 0
+    tradeDirection := 0
+    entryPrice     := na
+    initialStop    := na
+    rValue         := na
+    partialTaken   := false
+    trailingStop   := na
+    currentStop    := na
+    pendingStop    := na
+    entryConfirmed := false
+
+// ============================================================================
+// VISUAL AIDS
+// ============================================================================
+
+// Plot current stop level
+plot(strategy.position_size != 0 ? currentStop : na, "Active Stop", color=color.red, style=plot.style_cross, linewidth=2)
+
+// Show risk control status in background
+bgcolor(not riskAllowEntry ? color.new(color.red, 85) : na, title="Risk Limit Active")
+
+// ============================================================================
+// INFORMATION TABLE
+// ============================================================================
+
+var table infoTable = table.new(position.top_right, 2, 7, bgcolor=color.new(color.black, 80), border_width=1)
+
+if barstate.islast
+    table.cell(infoTable, 0, 0, "4H Trend",        text_color=color.white, text_size=size.small)
+    table.cell(infoTable, 1, 0, trendUp ? "BULL" : trendDown ? "BEAR" : "NEUTRAL",
+         text_color=trendUp ? color.green : trendDown ? color.red : color.gray, text_size=size.small)
+
+    table.cell(infoTable, 0, 1, "Compression",     text_color=color.white, text_size=size.small)
+    table.cell(infoTable, 1, 1, compressionActive ? "ACTIVE" : "OFF",
+         text_color=compressionActive ? color.yellow : color.gray, text_size=size.small)
+
+    table.cell(infoTable, 0, 2, "Attempts",        text_color=color.white, text_size=size.small)
+    table.cell(infoTable, 1, 2, str.tostring(attemptCount) + " / " + str.tostring(i_maxAttempts),
+         text_color=color.white, text_size=size.small)
+
+    table.cell(infoTable, 0, 3, "Session",         text_color=color.white, text_size=size.small)
+    table.cell(infoTable, 1, 3, inSession ? "OPEN" : "CLOSED",
+         text_color=inSession ? color.green : color.gray, text_size=size.small)
+
+    table.cell(infoTable, 0, 4, "Daily Losses",    text_color=color.white, text_size=size.small)
+    table.cell(infoTable, 1, 4, str.tostring(dailyLossCount) + " / " + str.tostring(i_maxLossPerDay),
+         text_color=dailyLossCount >= i_maxLossPerDay ? color.red : color.white, text_size=size.small)
+
+    table.cell(infoTable, 0, 5, "Daily P&L %",     text_color=color.white, text_size=size.small)
+    table.cell(infoTable, 1, 5, str.tostring(math.round(dailyPnlPct, 2)) + "%",
+         text_color=dailyPnlPct >= 0 ? color.green : color.red, text_size=size.small)
+
+    table.cell(infoTable, 0, 6, "Weekly P&L %",    text_color=color.white, text_size=size.small)
+    table.cell(infoTable, 1, 6, str.tostring(math.round(weeklyPnlPct, 2)) + "%",
+         text_color=weeklyPnlPct >= 0 ? color.green : color.red, text_size=size.small)
+
+// ============================================================================
+// END OF STRATEGY
+// ============================================================================
