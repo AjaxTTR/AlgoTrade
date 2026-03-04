@@ -55,6 +55,7 @@ def generate_signals(
         - tp_price: ATR-based take-profit target
         - range_high: opening range upper boundary
         - range_low: opening range lower boundary
+        - session_close: True on the first bar at or after session_end each day
         - atr: Average True Range
     """
     out = df.copy()
@@ -155,5 +156,16 @@ def generate_signals(
     tp_price[long_mask] = close_vals[long_mask] + (atr_vals[long_mask] * tp_atr_multiple)
     tp_price[short_mask] = close_vals[short_mask] - (atr_vals[short_mask] * tp_atr_multiple)
     out["tp_price"] = tp_price
+
+    # Session close: first bar at or after session_end each day
+    past_session_end = pd.Series(
+        bar_mins_since_midnight >= session_end_mins, index=out.index
+    )
+    # Mark only the first such bar per day using shift: True now but False previous bar (or new day)
+    prev_past = past_session_end.shift(1, fill_value=False)
+    prev_date_shifted = pd.Series(dates_arr, index=out.index).shift(1)
+    new_day = pd.Series(dates_arr, index=out.index) != prev_date_shifted
+
+    out["session_close"] = past_session_end & (~prev_past | new_day)
 
     return out
