@@ -110,7 +110,7 @@ def optimize(strategy_name: str = "strategy") -> pd.DataFrame:
 
     for i, params in enumerate(combos, 1):
         try:
-            signals = strategy_module.generate_signals(df, **params)
+            signals = strategy_module.generate_signals(df.copy(), **params)
             bt_result = run(signals, **BACKTEST_CONFIG)
             metrics = compute_metrics(bt_result, initial_capital=BACKTEST_CONFIG["initial_capital"])
 
