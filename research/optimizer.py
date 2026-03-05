@@ -8,7 +8,7 @@ research/results.csv.
 Usage:
     python -m research.optimizer [strategy_name]
 
-If no strategy name is provided, defaults to "strategy".
+If no strategy name is provided, defaults to "opening_range_breakout".
 """
 
 import importlib
@@ -19,6 +19,7 @@ import time
 from multiprocessing import Pool, cpu_count
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 
 logging.basicConfig(
@@ -43,14 +44,55 @@ BACKTEST_CONFIG = {
 }
 
 PARAM_GRID = {
-    "atr_period": [10, 14, 20],
-    "compression_lookback": [6, 8, 10],
-    "compression_ratio": [1.0, 1.2, 1.4],
-    "stop_atr_buffer": [0.8, 1.0, 1.2],
+    "orb_minutes": [15, 30, 45],
+    "tp_atr_multiple": [1.5, 2.0, 2.5, 3.0],
+    "min_orb_atr_ratio": [0.2, 0.3, 0.5],
+    "trade_window_end": ["10:30", "11:00", "11:30"],
+}
+
+# Multi-metric scoring configuration
+SCORING = {
+    "weights": {
+        "sharpe": 0.5,
+        "calmar": 0.3,
+        "profit_factor": 0.2,
+    },
+    "filters": {
+        "max_drawdown_threshold": -25.0,   # reject combos with DD worse than -25%
+        "min_trades": 20,                   # reject combos with fewer trades
+    },
 }
 
 OUTPUT_PATH = Path("research/results.csv")
 TOP_N = 10
+
+
+# ---------------------------------------------------------------------------
+# Scoring
+# ---------------------------------------------------------------------------
+
+def _compute_score(row: dict, scoring: dict) -> float:
+    """Compute composite score for a parameter combination."""
+    filters = scoring.get("filters", {})
+
+    # Apply filters — return -inf if any filter fails
+    max_dd = row.get("max_drawdown")
+    if max_dd is not None and max_dd < filters.get("max_drawdown_threshold", -100):
+        return -np.inf
+
+    n_trades = row.get("trades", 0) or 0
+    if n_trades < filters.get("min_trades", 0):
+        return -np.inf
+
+    # Weighted composite score
+    weights = scoring["weights"]
+    score = 0.0
+    for metric, weight in weights.items():
+        val = row.get(metric)
+        if val is None:
+            return -np.inf
+        score += weight * val
+    return score
 
 
 # ---------------------------------------------------------------------------
@@ -73,17 +115,6 @@ def _evaluate_combo(args: tuple) -> dict:
 
     Each worker loads its own copy of data and strategy module to avoid
     shared-state issues across processes.
-
-    Parameters
-    ----------
-    args : tuple
-        (params, strategy_name, data_file) where params is a dict of
-        strategy parameters.
-
-    Returns
-    -------
-    dict
-        Result row with parameters, strategy name, and performance metrics.
     """
     params, strategy_name, data_file = args
 
@@ -106,6 +137,8 @@ def _evaluate_combo(args: tuple) -> dict:
             **params,
             "total_return": mtm["total_return"],
             "sharpe": mtm["sharpe"],
+            "sortino": mtm["sortino"],
+            "calmar": mtm["calmar"],
             "max_drawdown": mtm["max_drawdown"],
             "profit_factor": trades["profit_factor"],
             "trades": trades["total_trades"],
@@ -117,6 +150,8 @@ def _evaluate_combo(args: tuple) -> dict:
             **params,
             "total_return": None,
             "sharpe": None,
+            "sortino": None,
+            "calmar": None,
             "max_drawdown": None,
             "profit_factor": None,
             "trades": 0,
@@ -128,14 +163,8 @@ def _evaluate_combo(args: tuple) -> dict:
 # Main
 # ---------------------------------------------------------------------------
 
-def optimize(strategy_name: str = "strategy") -> pd.DataFrame:
-    """Run grid search in parallel and return a DataFrame of results.
-
-    Parameters
-    ----------
-    strategy_name : str
-        Name of the strategy module inside strategies/ to optimise.
-    """
+def optimize(strategy_name: str = "opening_range_breakout") -> pd.DataFrame:
+    """Run grid search in parallel and return a DataFrame of results."""
     t_start = time.perf_counter()
 
     # Validate data file exists before spawning workers
@@ -177,9 +206,12 @@ def optimize(strategy_name: str = "strategy") -> pd.DataFrame:
     for r in results:
         r.pop("error", None)
 
-    # Build DataFrame and sort by Sharpe
+    # Compute composite scores and sort
+    for r in results:
+        r["composite_score"] = _compute_score(r, SCORING)
+
     results_df = pd.DataFrame(results)
-    results_df.sort_values("sharpe", ascending=False, na_position="last", inplace=True)
+    results_df.sort_values("composite_score", ascending=False, na_position="last", inplace=True)
     results_df.reset_index(drop=True, inplace=True)
 
     # Save
@@ -189,21 +221,23 @@ def optimize(strategy_name: str = "strategy") -> pd.DataFrame:
 
     # Print top N
     elapsed = time.perf_counter() - t_start
-    print("\n" + "=" * 90)
-    print(f"  TOP {TOP_N} PARAMETER SETS BY SHARPE RATIO")
-    print("=" * 90)
+    print("\n" + "=" * 100)
+    print(f"  TOP {TOP_N} PARAMETER SETS BY COMPOSITE SCORE")
+    print("=" * 100)
     display_cols = [
-        "sharpe", "total_return", "max_drawdown", "profit_factor", "trades",
-        *PARAM_GRID.keys(),
+        "composite_score", "sharpe", "calmar", "total_return", "max_drawdown",
+        "profit_factor", "trades", *PARAM_GRID.keys(),
     ]
     print(results_df[display_cols].head(TOP_N).to_string(index=True))
-    print("=" * 90)
+    print("=" * 100)
+    print(f"  Scoring weights: {SCORING['weights']}")
+    print(f"  Filters: {SCORING['filters']}")
     print(f"  Total combinations: {total}  |  Workers: {n_workers}  |  Runtime: {elapsed:.1f}s")
-    print("=" * 90 + "\n")
+    print("=" * 100 + "\n")
 
     return results_df
 
 
 if __name__ == "__main__":
-    name = sys.argv[1] if len(sys.argv) > 1 else "strategy"
+    name = sys.argv[1] if len(sys.argv) > 1 else "opening_range_breakout"
     optimize(name)

@@ -35,12 +35,14 @@ def _infer_bars_per_year(index: pd.DatetimeIndex) -> float:
     float
         Estimated bars per trading year.
     """
-    deltas = pd.Series(index).diff().dropna().dt.total_seconds()
-    median_seconds = deltas.median()
-    if median_seconds <= 0:
+    if len(index) < 2:
         return 252.0  # fallback: daily
-    bars_per_day = 86400 / median_seconds
-    return bars_per_day * 252
+    # Count actual bars per calendar day from the data, then scale to 252 trading days
+    bars_per_day = pd.Series(index).groupby(index.date).count()
+    avg_bars_per_day = bars_per_day.median()
+    if avg_bars_per_day <= 0:
+        return 252.0
+    return avg_bars_per_day * 252
 
 
 # ---------------------------------------------------------------------------
@@ -141,7 +143,7 @@ def _consecutive_runs(outcomes: np.ndarray) -> tuple[int, int]:
     return int(win_runs.max()), int(loss_runs.max())
 
 
-def _trade_metrics(trades: list) -> dict:
+def _trade_metrics(trades: list, bar_interval_seconds: float = 900.0) -> dict:
     """Compute trade-level performance statistics.
 
     Parameters
@@ -209,7 +211,7 @@ def _trade_metrics(trades: list) -> dict:
         "largest_loss": round(pnls.min(), 2),
         "consecutive_wins": consec_w,
         "consecutive_losses": consec_l,
-        "avg_duration_bars": round(durations.dt.total_seconds().mean() / (durations.dt.total_seconds().median() + _EPS), 1),
+        "avg_duration_bars": round(durations.dt.total_seconds().mean() / (bar_interval_seconds + _EPS), 1),
         "min_duration": str(min_dur),
         "max_duration": str(max_dur),
         "avg_duration": str(avg_dur),
@@ -244,9 +246,13 @@ def compute_metrics(result: BacktestResult, initial_capital: float = 100_000.0) 
     """
     bars_per_year = _infer_bars_per_year(result.equity_mtm.index)
 
+    # Infer median bar interval for duration calculations
+    deltas = pd.Series(result.equity_mtm.index).diff().dropna().dt.total_seconds()
+    bar_interval = deltas.median() if len(deltas) > 0 else 900.0
+
     mtm_metrics = _equity_metrics(result.equity_mtm, initial_capital, bars_per_year)
     closed_metrics = _equity_metrics(result.equity_closed, initial_capital, bars_per_year)
-    trade_stats = _trade_metrics(result.trades)
+    trade_stats = _trade_metrics(result.trades, bar_interval_seconds=bar_interval)
 
     return {
         "mtm": mtm_metrics,

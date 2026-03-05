@@ -1,3 +1,5 @@
+import engine.external_data_guard  # noqa: F401 — block external data providers
+
 """
 Run any strategy module from the command line.
 

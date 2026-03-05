@@ -1,5 +1,5 @@
 """
-Main entry point for the NQ Compression Breakout backtesting framework.
+Main entry point for the NQ Opening Range Breakout backtesting framework.
 
 Usage:
     python main.py
@@ -35,7 +35,7 @@ log = logging.getLogger(__name__)
 # Configuration
 # ---------------------------------------------------------------------------
 DATA_FILE = "data/nq_15m_data.csv"
-STRATEGY_NAME = "strategy"
+STRATEGY_NAME = "opening_range_breakout"
 
 BACKTEST_CONFIG = {
     "initial_capital": 100_000.0,
@@ -43,14 +43,27 @@ BACKTEST_CONFIG = {
     "point_value": 20.0,            # NQ futures: $20 per point
     "commission_per_side": 2.0,     # per contract per side
     "slippage_points": 0.25,        # adverse points per fill
+    "use_trailing_stop": True,      # enable partial TP + trailing stop
+    "trail_atr_multiple": 2.0,      # ATR multiplier for trail distance
+    "partial_tp_pct": 0.5,          # close 50% at TP
+    "move_stop_to_be": True,        # move stop to breakeven after partial
 }
 
 STRATEGY_CONFIG = {
+    "orb_minutes": 30,
+    "session_start": "09:30",
+    "session_end": "16:00",
+    "entry_cutoff": "14:30",
     "atr_period": 14,
-    "compression_lookback": 8,
-    "compression_ratio": 1.2,
-    "stop_atr_buffer": 1.0,
-    "require_candle_confirm": False,
+    "tp_atr_multiple": 2.0,
+    "min_orb_atr_ratio": 0.3,
+    "use_vwap_filter": True,
+    "min_atr_percent": 0.003,
+    "min_gap_atr_ratio": 0.25,
+    "trade_window_start": "09:30",
+    "trade_window_end": "11:00",
+    "max_trades_per_day": 1,
+    "atr_ma_period": 50,
 }
 
 OUTPUT_DIR = Path(".")
@@ -110,7 +123,7 @@ def main() -> None:
     t_start = time.perf_counter()
 
     print("\n" + "=" * 62)
-    print("  NQ COMPRESSION BREAKOUT — BACKTEST")
+    print("  NQ OPENING RANGE BREAKOUT — BACKTEST")
     print("=" * 62)
 
     _print_config("Backtest Configuration", BACKTEST_CONFIG)
