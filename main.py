@@ -40,7 +40,7 @@ STRATEGY_NAME = "first_hour_momentum"
 
 BACKTEST_CONFIG = {
     "initial_capital": 100_000.0,
-    "risk_per_trade": 0.005,        # 0.5% of equity per trade
+    "risk_per_trade": 0.01,         # 1% of equity per trade
     "point_value": 20.0,            # NQ futures: $20 per point
     "commission_per_side": 2.0,     # per contract per side
     "slippage_points": 0.25,        # adverse points per fill

@@ -1,7 +1,7 @@
 """
-First-Hour Momentum: pullback re-entry comparison.
+First-Hour Momentum: early entry comparison.
 
-Tests the enhanced strategy with pullback re-entries vs initial-only baseline.
+Tests early entry (10:00) vs standard (10:30) vs combined.
 
 Run: python -m research.threshold_comparison
 """
@@ -22,7 +22,7 @@ OUTPUT_DIR = Path("output/edge_analysis")
 
 BACKTEST_CONFIG = {
     "initial_capital": 100_000.0,
-    "risk_per_trade": 0.005,
+    "risk_per_trade": 0.01,
     "point_value": 20.0,
     "commission_per_side": 2.0,
     "slippage_points": 0.25,
@@ -59,7 +59,7 @@ def main():
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
     print("=" * 80)
-    print("  FIRST-HOUR MOMENTUM: PULLBACK RE-ENTRY COMPARISON")
+    print("  FIRST-HOUR MOMENTUM: EARLY ENTRY COMPARISON")
     print("=" * 80)
     print("\nLoading data...")
     df = load_csv("data/nq_15m_data.csv")
@@ -69,25 +69,17 @@ def main():
     # Part 1: Configuration comparison
     # ================================================================
     configs = [
-        ("Baseline (1 trade/day)", {
-            "fh_percentile": 80.0, "max_trades_per_day": 1,
-            "pullback_atr_frac": 0.5,
+        ("Standard only (10:30)", {
+            "enable_early_entry": False,
+            "max_trades_per_day": 3,
         }),
-        ("Pullback 0.3 ATR, max 2", {
-            "fh_percentile": 80.0, "max_trades_per_day": 2,
-            "pullback_atr_frac": 0.3,
+        ("Early + standard (10:00/10:30)", {
+            "enable_early_entry": True,
+            "max_trades_per_day": 3,
         }),
-        ("Pullback 0.5 ATR, max 2", {
-            "fh_percentile": 80.0, "max_trades_per_day": 2,
-            "pullback_atr_frac": 0.5,
-        }),
-        ("Pullback 0.5 ATR, max 3", {
-            "fh_percentile": 80.0, "max_trades_per_day": 3,
-            "pullback_atr_frac": 0.5,
-        }),
-        ("Pullback 0.75 ATR, max 3", {
-            "fh_percentile": 80.0, "max_trades_per_day": 3,
-            "pullback_atr_frac": 0.75,
+        ("Early + standard, max 2", {
+            "enable_early_entry": True,
+            "max_trades_per_day": 2,
         }),
     ]
 
@@ -98,13 +90,14 @@ def main():
         print(f"  {name}")
         print(f"{'-' * 80}")
 
-        signals = generate_signals(df, **strategy_params)
+        signals = generate_signals(df, fh_percentile=80.0, pullback_atr_frac=0.5,
+                                    **strategy_params)
         n_signals = int((signals["signal"] != 0).sum())
 
-        # Count signals by tier
-        tier1_sigs = int((signals["signal_tier"] == 1).sum())
-        tier2_sigs = int((signals["signal_tier"] == 2).sum())
-        print(f"  Signals: {n_signals}  (initial: {tier1_sigs}, pullback: {tier2_sigs})")
+        t1 = int((signals["signal_tier"] == 1).sum())
+        t2 = int((signals["signal_tier"] == 2).sum())
+        t3 = int((signals["signal_tier"] == 3).sum())
+        print(f"  Signals: {n_signals}  (early: {t1}, standard: {t2}, pullback: {t3})")
 
         result = run_backtest(signals, **BACKTEST_CONFIG)
         n_trades = len(result.trades)
@@ -124,8 +117,9 @@ def main():
             "config": name,
             "trades": n_trades,
             "trades_per_year": round(n_trades / 7, 1),
-            "initial_sigs": tier1_sigs,
-            "pullback_sigs": tier2_sigs,
+            "early_sigs": t1,
+            "standard_sigs": t2,
+            "pullback_sigs": t3,
             "win_rate": round(100 * wins / n_trades, 1),
             "total_pnl": round(total_pnl, 2),
             "avg_pnl": round(avg_pnl, 2),
@@ -147,7 +141,7 @@ def main():
         print(f"  Profit factor: {row['profit_factor']}")
 
     comp_df = pd.DataFrame(results)
-    comp_df.to_csv(OUTPUT_DIR / "pullback_comparison.csv", index=False)
+    comp_df.to_csv(OUTPUT_DIR / "early_entry_comparison.csv", index=False)
 
     print(f"\n{'=' * 80}")
     print("  CONFIGURATION COMPARISON")
@@ -158,9 +152,9 @@ def main():
                    "profit_factor", "avg_pnl"]
     available = [c for c in header_cols if c in comp_df.columns]
 
-    fmt = "  {:<28s}" + "  {:<14s}" * (len(available) - 1)
+    fmt = "  {:<30s}" + "  {:<14s}" * (len(available) - 1)
     print(fmt.format(*available))
-    print("  " + "-" * (28 + 16 * (len(available) - 1)))
+    print("  " + "-" * (30 + 16 * (len(available) - 1)))
 
     for _, r in comp_df.iterrows():
         vals = []
@@ -173,25 +167,24 @@ def main():
         print(fmt.format(*vals))
 
     # ================================================================
-    # Part 2: Per-tier breakdown for best pullback config
+    # Part 2: Per-tier breakdown
     # ================================================================
     print(f"\n{'=' * 80}")
-    print("  PER-TIER BREAKDOWN (Pullback 0.5 ATR, max 3)")
+    print("  PER-TIER BREAKDOWN (Early + standard, max 3)")
     print(f"{'=' * 80}\n")
 
-    signals = generate_signals(df, fh_percentile=80.0, max_trades_per_day=3,
-                                pullback_atr_frac=0.5)
+    signals = generate_signals(df, fh_percentile=80.0, pullback_atr_frac=0.5,
+                                enable_early_entry=True, max_trades_per_day=3)
 
-    # Map signal_time -> tier
     tier_signals = signals[signals["signal"] != 0][["signal_tier"]].copy()
     tier_map = {ts: int(row["signal_tier"]) for ts, row in tier_signals.iterrows()}
     signal_times = sorted(tier_map.keys())
 
     result = run_backtest(signals, **BACKTEST_CONFIG)
 
-    # Match trades to tiers
-    tier1_trades = []
-    tier2_trades = []
+    early_trades = []
+    standard_trades = []
+    pullback_trades = []
     for t in result.trades:
         matched_tier = 0
         for st in signal_times:
@@ -200,17 +193,20 @@ def main():
             elif st >= t.entry_time:
                 break
         if matched_tier == 1:
-            tier1_trades.append(t)
+            early_trades.append(t)
+        elif matched_tier == 2:
+            standard_trades.append(t)
         else:
-            tier2_trades.append(t)
+            pullback_trades.append(t)
 
     tier_rows = [
         _tier_stats(result.trades, "All trades"),
-        _tier_stats(tier1_trades, "Initial entries"),
-        _tier_stats(tier2_trades, "Pullback re-entries"),
+        _tier_stats(early_trades, "Early (10:00)"),
+        _tier_stats(standard_trades, "Standard (10:30)"),
+        _tier_stats(pullback_trades, "Pullback re-entries"),
     ]
     tier_df = pd.DataFrame(tier_rows)
-    tier_df.to_csv(OUTPUT_DIR / "pullback_tier_breakdown.csv", index=False)
+    tier_df.to_csv(OUTPUT_DIR / "early_entry_tier_breakdown.csv", index=False)
 
     tier_cols = ["config", "trades", "trades_per_year", "win_rate",
                  "total_pnl", "avg_pnl", "profit_factor"]
@@ -234,7 +230,7 @@ def main():
     # Part 3: Trades-per-day distribution
     # ================================================================
     print(f"\n{'=' * 80}")
-    print("  TRADES PER DAY DISTRIBUTION (Pullback 0.5 ATR, max 3)")
+    print("  TRADES PER DAY DISTRIBUTION (Early + standard, max 3)")
     print(f"{'=' * 80}\n")
 
     trade_dates = [t.entry_time.date() for t in result.trades]
@@ -247,8 +243,8 @@ def main():
         print(f"  Total trading days: {len(trades_per_day)}")
 
     print(f"\n  Saved to: {OUTPUT_DIR.resolve()}/")
-    print(f"    - pullback_comparison.csv")
-    print(f"    - pullback_tier_breakdown.csv")
+    print(f"    - early_entry_comparison.csv")
+    print(f"    - early_entry_tier_breakdown.csv")
 
 
 if __name__ == "__main__":

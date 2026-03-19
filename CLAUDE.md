@@ -50,7 +50,7 @@ Requires `data/nq_15m_data.csv` with columns: `timestamp, open, high, low, close
 
 **Backtest:**
 - Initial capital: $100,000
-- Risk per trade: 0.5% of equity
+- Risk per trade: 1% of equity
 - Point value: $20 (NQ futures)
 - Commission: $2/side, slippage: 0.25 pts
 - Daily drawdown limit: 2%
@@ -59,7 +59,8 @@ Requires `data/nq_15m_data.csv` with columns: `timestamp, open, high, low, close
 
 **Strategy (First-Hour Momentum):**
 - Edge: FH_Up -> Rest_Up (t=30.38, stability=0.946), long only
-- First-hour window: 09:30-10:30 ET
+- Early entry window: 09:30-10:00 ET (if 30-min return already exceeds threshold)
+- Full first-hour window: 09:30-10:30 ET (standard entry fallback)
 - Bias filter: top 20% first-hour moves (80th percentile, expanding window)
 - Session: 09:30-16:00 ET, entry cutoff 15:45
 - ATR period: 14, stop at 1.5x ATR, TP at 2.0x ATR
@@ -69,13 +70,13 @@ Requires `data/nq_15m_data.csv` with columns: `timestamp, open, high, low, close
 
 ## Strategy Pipeline
 
-1. **First-Hour Observation** — Measure return from 09:30-10:30 (open to close)
-2. **Bias Filter** — Only trade if first-hour return exceeds 80th percentile of prior days (expanding window, no lookahead)
-3. **Initial Entry** — Signal on first bar at/after 10:30, fill at 10:45 open (long only)
+1. **Early Bias Detection** — Measure return from 09:30-10:00 (first 30 min); if it already exceeds the threshold, enter early at 10:00
+2. **Full First-Hour Check** — If no early entry, measure return from 09:30-10:30 and enter at 10:30 if threshold exceeded
+3. **Bias Filter** — Threshold = 80th percentile of |fh_return| from all prior days (expanding window, no lookahead)
 4. **Pullback Re-entries** — After each trade's holding-period exit, re-enter on pullback bars (dip >= 0.5 ATR from session high, bar closes in upper half)
 5. **Risk Sizing** — ATR-based volatility sizing: equity * risk_per_trade / (ATR * point_value), supports size_factor column
 6. **Trade Management** — Stop at 1.5x ATR below entry, TP at 2.0x ATR above; 8-bar holding period exit via session_close flag
-7. **Daily Limits** — Max 3 trades/day, 5% daily drawdown limit enforced
+7. **Daily Limits** — Max 3 trades/day, 2% daily drawdown limit, pre-entry risk gate
 
 ## Key Conventions
 

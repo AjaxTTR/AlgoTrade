@@ -10,12 +10,12 @@ Long only -- the short side showed weaker edge quality.
 Trade logic:
   1. Bias filter: only trade on days where first-hour return is in the
      top 20% historically (80th percentile, expanding window).
-  2. Initial entry: first bar at/after 10:30 on bias days.
-  3. Pullback re-entries: after the initial trade exits (holding period),
-     re-enter long on pullback-and-recovery bars.  Pullback = price dips
-     from running session high by at least pullback_atr_frac * ATR, then
-     the bar closes in its upper half (buying pressure returning).
-  4. Max trades per day caps total entries.
+  2. Early entry: if the first 30 minutes (09:30-10:00) already exceed
+     the threshold, enter at 10:00 instead of waiting until 10:30.
+  3. Standard entry: otherwise, enter at 10:30 after full first hour.
+  4. Pullback re-entries: after each trade exits (holding period),
+     re-enter long on pullback-and-recovery bars.
+  5. Max trades per day caps total entries.
 
 Every strategy module in /strategies must expose:
 
@@ -34,6 +34,7 @@ def generate_signals(
     session_start: str = "09:30",
     session_end: str = "16:00",
     fh_end: str = "10:30",
+    early_end: str = "10:00",
     entry_cutoff: str = "15:45",
     fh_threshold: float = 0.0,
     fh_percentile: float = 80.0,
@@ -43,9 +44,10 @@ def generate_signals(
     holding_bars: int = 8,
     max_trades_per_day: int = 3,
     pullback_atr_frac: float = 0.5,
+    enable_early_entry: bool = True,
     **kwargs,
 ) -> pd.DataFrame:
-    """First-Hour Momentum with pullback re-entries.
+    """First-Hour Momentum with early entry and pullback re-entries.
 
     Parameters
     ----------
@@ -53,6 +55,10 @@ def generate_signals(
         OHLCV data with a DatetimeIndex (15-min bars expected).
     session_start / session_end / fh_end / entry_cutoff : str
         Time boundaries for the session and first-hour window.
+    early_end : str
+        End of the early observation window (default "10:00").
+        If the return from session_start to early_end already exceeds the
+        threshold, enter at early_end instead of waiting for fh_end.
     fh_threshold : float
         Hard minimum |fh_return| floor (default 0.0, disabled).
     fh_percentile : float
@@ -67,18 +73,20 @@ def generate_signals(
     holding_bars : int
         Bars to hold each trade (default 8 = 2 hours on 15-min bars).
     max_trades_per_day : int
-        Maximum entries per bias day (default 3).  The first is the
-        initial breakout; additional entries are pullback re-entries.
+        Maximum entries per bias day (default 3).
     pullback_atr_frac : float
         Minimum pullback depth from running session high as a fraction
-        of ATR (default 0.5).  The bar must also close in its upper
-        half to confirm buying pressure is returning.
+        of ATR (default 0.5).
+    enable_early_entry : bool
+        If True, check 30-min return for early entry at early_end
+        (default True).  If False, always wait for fh_end.
 
     Returns
     -------
     pd.DataFrame
         Copy of input with added columns: signal, stop_price, tp_price,
         session_close, atr, fh_return, size_factor, signal_tier.
+        signal_tier: 1 = early entry, 2 = standard entry, 3 = pullback.
     """
     out = df.copy()
     n = len(out)
@@ -101,6 +109,7 @@ def generate_signals(
     # ------------------------------------------------------------------
     time = out.index.time
     t_session_start = pd.Timestamp(session_start).time()
+    t_early_end = pd.Timestamp(early_end).time()
     t_fh_end = pd.Timestamp(fh_end).time()
     t_session_end = pd.Timestamp(session_end).time()
     t_entry_cutoff = pd.Timestamp(entry_cutoff).time()
@@ -109,7 +118,6 @@ def generate_signals(
 
     # ------------------------------------------------------------------
     # Session close flag (15:45 EOD backstop)
-    # Holding-period exits are added per-signal below.
     # ------------------------------------------------------------------
     past_cutoff = time >= t_entry_cutoff
     new_day = out["date"] != pd.Series(out["date"]).shift(1).values
@@ -117,7 +125,9 @@ def generate_signals(
     out["session_close"] = past_cutoff & (~prev_past | new_day)
 
     # ------------------------------------------------------------------
-    # First-hour return per day (no lookahead)
+    # First-hour return per day (full 60 min, no lookahead)
+    # Used for: threshold computation (expanding percentile) and
+    #           standard 10:30 entry decision.
     # ------------------------------------------------------------------
     in_fh = (time >= t_session_start) & (time < t_fh_end)
     fh_bars = out[in_fh]
@@ -128,7 +138,21 @@ def generate_signals(
     out["fh_return"] = out["date"].map(fh_return)
 
     # ------------------------------------------------------------------
+    # Early return per day (first 30 min: 09:30-10:00)
+    # Used for: early entry decision at 10:00.
+    # ------------------------------------------------------------------
+    in_early = (time >= t_session_start) & (time < t_early_end)
+    early_bars = out[in_early]
+    early_open = early_bars.groupby("date")["open"].first()
+    early_close = early_bars.groupby("date")["close"].last()
+    early_return = (early_close - early_open) / early_open
+    early_return.name = "early_return"
+    out["early_return"] = out["date"].map(early_return)
+
+    # ------------------------------------------------------------------
     # Adaptive threshold: expanding percentile of |fh_return|
+    # Built from FULL first-hour returns (60 min) of prior days.
+    # The same threshold is used for both early and standard entries.
     # ------------------------------------------------------------------
     MIN_HISTORY = 20
     fh_abs = fh_return.abs()
@@ -146,7 +170,6 @@ def generate_signals(
 
     # ------------------------------------------------------------------
     # Running session high (for pullback detection)
-    # Reset at session start each day, track cumulative high.
     # ------------------------------------------------------------------
     session_high = np.full(n, np.nan)
     current_high = np.nan
@@ -165,26 +188,35 @@ def generate_signals(
     out["session_high"] = session_high
 
     # ------------------------------------------------------------------
-    # Identify bias days: fh_return > threshold (top 20%)
+    # Identify bias days and early-eligible days
+    #
+    # bias_days: fh_return (full 60 min) > threshold
+    # early_days: early_return (first 30 min) > threshold
+    #   (subset of days where the move is so strong that 30 min
+    #    already exceeds the typical full-hour threshold)
     # ------------------------------------------------------------------
     bias_days = set()
-    fh_thresh_by_date = {}
+    early_days = set()
     for d in daily_dates:
-        fhr = fh_return.get(d, np.nan)
         thresh_val = expanding_thresh.get(d, np.nan)
         eff = max(thresh_val if not pd.isna(thresh_val) else fh_threshold, fh_threshold)
-        fh_thresh_by_date[d] = eff
+
+        fhr = fh_return.get(d, np.nan)
         if not pd.isna(fhr) and fhr > eff:
             bias_days.add(d)
 
+        if enable_early_entry:
+            er = early_return.get(d, np.nan)
+            if not pd.isna(er) and er > eff:
+                early_days.add(d)
+
     # ------------------------------------------------------------------
-    # Signal generation: initial entry + pullback re-entries
+    # Signal generation
     #
-    # Pass 1: Place initial entry on first bar at/after fh_end on bias days.
-    # Pass 2: On bias days, after each trade's expected exit, scan for
-    #          pullback re-entry bars until max_trades_per_day is reached.
-    #
-    # signal_tier: 1 = initial entry, 2 = pullback re-entry
+    # For each day:
+    #   1. If early_days: enter at first bar at/after early_end (tier=1)
+    #   2. Elif bias_days: enter at first bar at/after fh_end (tier=2)
+    #   3. Pullback re-entries after each trade exits (tier=3)
     # ------------------------------------------------------------------
     out["signal"] = 0
     out["stop_price"] = np.nan
@@ -192,11 +224,6 @@ def generate_signals(
     out["size_factor"] = 1.0
     out["signal_tier"] = 0
 
-    at_or_after_fh = time >= t_fh_end
-    before_cutoff = time < t_entry_cutoff
-    in_session = (time >= t_session_start) & (time < t_session_end)
-
-    # Precompute column indices for fast iloc assignment
     sig_col = out.columns.get_loc("signal")
     stop_col = out.columns.get_loc("stop_price")
     tp_col = out.columns.get_loc("tp_price")
@@ -222,14 +249,13 @@ def generate_signals(
         out.iloc[idx, tp_col] = entry_px + (atr_val * tp_atr_multiple)
         out.iloc[idx, sf_col] = 1.0
         out.iloc[idx, tier_col] = tier
-        # Place holding-period exit
         if holding_bars > 0:
             exit_idx = idx + 1 + holding_bars
             if exit_idx < n:
                 out.iloc[exit_idx, sc_col] = True
         return True
 
-    # Group bars by date for efficient iteration
+    # Group bars by date
     date_bar_ranges = {}
     current_d = None
     start_i = 0
@@ -243,28 +269,40 @@ def generate_signals(
     if current_d is not None:
         date_bar_ranges[current_d] = (start_i, n)
 
-    for d in sorted(bias_days):
+    # All tradeable days = union of early_days and bias_days
+    all_trade_days = bias_days | early_days
+
+    for d in sorted(all_trade_days):
         if d not in date_bar_ranges:
             continue
         d_start, d_end = date_bar_ranges[d]
         trades_today = 0
-
-        # --- Pass 1: Initial entry at first bar at/after fh_end ---
         initial_signal_idx = None
-        for i in range(d_start, d_end):
-            t = time[i]
-            if t >= t_fh_end and t < t_entry_cutoff and t >= t_session_start and t < t_session_end:
-                if _place_signal(i, tier=1):
-                    initial_signal_idx = i
-                    trades_today = 1
-                break  # only first qualifying bar
+
+        # --- Try early entry (10:00) ---
+        if d in early_days:
+            for i in range(d_start, d_end):
+                t = time[i]
+                if t >= t_early_end and t < t_entry_cutoff and t >= t_session_start and t < t_session_end:
+                    if _place_signal(i, tier=1):
+                        initial_signal_idx = i
+                        trades_today = 1
+                    break
+
+        # --- Fallback: standard entry (10:30) ---
+        if initial_signal_idx is None and d in bias_days:
+            for i in range(d_start, d_end):
+                t = time[i]
+                if t >= t_fh_end and t < t_entry_cutoff and t >= t_session_start and t < t_session_end:
+                    if _place_signal(i, tier=2):
+                        initial_signal_idx = i
+                        trades_today = 1
+                    break
 
         if initial_signal_idx is None:
             continue
 
-        # --- Pass 2: Pullback re-entries after each trade's exit ---
-        # Each trade: signal at bar S, fills at S+1, exits at S+1+holding_bars.
-        # Next signal can be placed at exit_bar or later (backtester is flat).
+        # --- Pullback re-entries ---
         next_eligible = initial_signal_idx + 1 + holding_bars
 
         while trades_today < max_trades_per_day:
@@ -272,37 +310,35 @@ def generate_signals(
             for i in range(max(next_eligible, d_start), d_end):
                 t = time[i]
                 if t >= t_entry_cutoff or t >= t_session_end:
-                    break  # past cutoff, done for the day
+                    break
 
                 atr_val = atrs[i]
                 sh = sess_highs[i]
                 if pd.isna(atr_val) or atr_val <= 0 or pd.isna(sh):
                     continue
 
-                # Pullback condition: bar dipped from session high by threshold
                 pullback_depth = sh - lows[i]
                 min_pullback = pullback_atr_frac * atr_val
                 if pullback_depth < min_pullback:
                     continue
 
-                # Recovery condition: bar closes in upper half of its range
                 bar_range = highs[i] - lows[i]
                 if bar_range <= 0:
                     continue
                 if closes[i] < (highs[i] + lows[i]) / 2.0:
                     continue
 
-                # Place pullback re-entry
-                if _place_signal(i, tier=2):
+                if _place_signal(i, tier=3):
                     trades_today += 1
                     next_eligible = i + 1 + holding_bars
                     found = True
-                    break  # scan for next re-entry from new eligible bar
+                    break
 
             if not found:
-                break  # no more pullbacks today
+                break
 
     # Clean up working columns
-    out.drop(columns=["date", "fh_pctile_thresh", "fh_eff_thresh", "session_high"], inplace=True)
+    out.drop(columns=["date", "fh_pctile_thresh", "fh_eff_thresh",
+                       "session_high", "early_return"], inplace=True)
 
     return out
