@@ -34,7 +34,7 @@ def _simulate_single(
     balance = config["starting_balance"]
     equity_peak = balance
     profit_target_usd = balance * config["profit_target"]
-    max_dd_usd = balance * config["max_drawdown_limit"]
+    max_dd_frac = config["max_drawdown_limit"]
     daily_dd_frac = config["daily_drawdown_limit"]
     max_days = config["max_days"]
 
@@ -77,8 +77,8 @@ def _simulate_single(
                     "trades_taken": i + 1,
                 }
 
-        # Max drawdown check
-        if max_dd_usd > 0 and dd_from_peak >= max_dd_usd:
+        # Max trailing drawdown check (from high-water mark)
+        if max_dd_frac > 0 and dd_from_peak >= equity_peak * max_dd_frac:
             return {
                 "outcome": "FAIL",
                 "reason": "max_dd",

@@ -22,6 +22,7 @@ import pandas as pd
 from engine.data_loader import load_csv
 from engine.backtester import run
 from engine.metrics import compute_metrics, print_metrics, plot_results, validate_strategy, print_validation
+from engine.prop_firm import simulate_prop_firm, print_prop_firm
 
 logging.basicConfig(
     level=logging.INFO,
@@ -61,6 +62,30 @@ STRATEGY_CONFIG = {
     "holding_bars": 8,              # 2 hours on 15-min bars
     "max_trades_per_day": 3,        # initial + pullback re-entries
     "pullback_atr_frac": 0.5,       # min pullback depth from session high
+}
+
+PROP_FIRM_CONFIGS = {
+    "FTMO Phase 1": {
+        "starting_balance": 100_000.0,
+        "profit_target": 0.10,          # 10%
+        "daily_drawdown_limit": 0.05,   # 5%
+        "max_drawdown_limit": 0.10,     # 10% trailing
+        "max_days": 30,
+    },
+    "FTMO Phase 2": {
+        "starting_balance": 100_000.0,
+        "profit_target": 0.05,          # 5%
+        "daily_drawdown_limit": 0.05,   # 5%
+        "max_drawdown_limit": 0.10,     # 10% trailing
+        "max_days": 60,
+    },
+    "Conservative (8% / 4%)": {
+        "starting_balance": 100_000.0,
+        "profit_target": 0.08,          # 8%
+        "daily_drawdown_limit": 0.04,   # 4%
+        "max_drawdown_limit": 0.08,     # 8% trailing
+        "max_days": 45,
+    },
 }
 
 OUTPUT_DIR = Path("output")
@@ -183,10 +208,26 @@ def main() -> None:
     validation = validate_strategy(metrics)
     print_validation(validation)
 
+    # --- Prop firm simulation ---
+    log.info("Running prop firm simulations")
+    prop_results = {}
+    for firm_name, firm_cfg in PROP_FIRM_CONFIGS.items():
+        pf = simulate_prop_firm(result, config=firm_cfg, n_simulations=500, seed=42)
+        prop_results[firm_name] = pf
+        print_prop_firm(pf)
+
     # --- Export ---
     OUTPUT_DIR.mkdir(exist_ok=True)
     _export_trades(result.trades, OUTPUT_DIR / "trade_log.csv")
     _export_results(result, metrics, OUTPUT_DIR)
+
+    # Prop firm results (JSON)
+    pf_export = {}
+    for name, pf in prop_results.items():
+        pf_export[name] = {k: v for k, v in pf.items() if k != "config"}
+    pf_path = OUTPUT_DIR / "prop_firm_results.json"
+    pf_path.write_text(json.dumps(pf_export, indent=2, default=str))
+    log.info("Prop firm results saved to %s", pf_path)
 
     # --- Plots ---
     log.info("Generating plots")
