@@ -43,12 +43,13 @@ STEP_MONTHS = 3
 
 BACKTEST_CONFIG = {
     "initial_capital": 100_000.0,
-    "risk_per_trade": 0.015,
+    "risk_per_trade": 0.005,
     "point_value": 20.0,
     "commission_per_side": 2.0,
     "slippage_points": 0.25,
     "use_trailing_stop": False,
-    "daily_dd_limit": 0.05,
+    "daily_dd_limit": 0.02,
+    "max_daily_risk": 0.02,
     "max_dd_limit": 0.0,
 }
 

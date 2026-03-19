@@ -69,6 +69,7 @@ def run(
     vol_stop_tighten_threshold: float = 1.5,
     vol_stop_tighten_factor: float = 0.75,
     max_bars_in_trade: int = 0,
+    max_daily_risk: float = 0.0,
     **kwargs,
 ) -> BacktestResult:
     """Execute a backtest over a signal DataFrame.
@@ -143,6 +144,12 @@ def run(
     max_bars_in_trade : int
         Force-exit after this many bars in a trade (default 0 = disabled).
         Prevents capital lock-up in stale positions.
+    max_daily_risk : float
+        Max cumulative risk as fraction of day-start equity (default 0 = disabled).
+        Before each new entry, check if the day's realised losses plus the
+        new trade's worst-case stop loss would exceed this cap.  If so,
+        skip the entry.  This limits total daily exposure across multiple
+        sequential trades.
 
     Returns
     -------
@@ -219,13 +226,14 @@ def run(
     daily_halted = False        # daily halt (resets each new day)
     equity_peak = initial_capital
     day_start_equity = initial_capital
+    day_realized_loss = 0.0     # cumulative realised loss today (positive = loss)
     current_date = timestamps[0].date()
 
     trades: list[TradeRecord] = []
 
     def _record_exit(exit_bar, fill_px, size, reason):
         """Helper to record a trade exit and update equity."""
-        nonlocal bar_cash_flow, closed_equity, prev_mtm
+        nonlocal bar_cash_flow, closed_equity, prev_mtm, day_realized_loss
         gross_pnl = pos_dir * (fill_px - entry_price) * size * point_value
         exit_comm = commission_per_side * size
         net_pnl = gross_pnl - exit_comm
@@ -233,6 +241,8 @@ def run(
         mtm_share = prev_mtm * (size / pos_size) if pos_size > 0 else 0.0
         bar_cash_flow += net_pnl + mtm_share
         closed_equity += net_pnl
+        if net_pnl < 0:
+            day_realized_loss += abs(net_pnl)
         mae_mfe_ratio = trade_mae / trade_mfe if trade_mfe > 0 else 0.0
         trades.append(TradeRecord(
             entry_time=timestamps[entry_idx],
@@ -261,6 +271,7 @@ def run(
             current_date = bar_date
             daily_halted = False
             day_start_equity = equity_mtm[i - 1]
+            day_realized_loss = 0.0
 
         # Track equity peak
         if equity_mtm[i - 1] > equity_peak:
@@ -445,6 +456,29 @@ def run(
             sfactor = pending_size_factor
 
             fill_price = opens[i] + market_cost if sig == 1 else opens[i] - market_cost
+
+            # Max daily risk gate: skip entry if adding this trade's
+            # worst-case loss would push total daily risk past the cap.
+            if max_daily_risk > 0 and day_start_equity > 0:
+                trade_worst_case = equity_mtm[i - 1] * risk_per_trade * sfactor
+                total_if_loss = day_realized_loss + trade_worst_case
+                daily_risk_cap = day_start_equity * max_daily_risk
+                if total_if_loss > daily_risk_cap:
+                    log.debug(
+                        "Bar %d: daily risk gate — realized=$%.0f + new=$%.0f "
+                        "> cap=$%.0f, skipping entry",
+                        i, day_realized_loss, trade_worst_case, daily_risk_cap,
+                    )
+                    pending_signal = 0
+                    pending_stop = np.nan
+                    pending_tp = np.nan
+                    pending_fill_bar = -1
+                    pending_size_factor = 1.0
+                    # Skip to MTM update
+                    current_mtm = 0.0
+                    equity_mtm[i] = equity_mtm[i - 1] + bar_cash_flow
+                    equity_closed[i] = closed_equity
+                    continue
 
             risk_amount = equity_mtm[i - 1] * risk_per_trade * sfactor
             contracts = 0

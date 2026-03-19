@@ -37,10 +37,12 @@ DATA_FILE = "data/nq_15m_data.csv"
 
 BACKTEST_CONFIG = {
     "initial_capital": 100_000.0,
-    "risk_per_trade": 0.015,
+    "risk_per_trade": 0.005,
     "point_value": 20.0,
     "commission_per_side": 2.0,
     "slippage_points": 0.25,
+    "daily_dd_limit": 0.02,
+    "max_daily_risk": 0.02,
 }
 
 BASE_STRATEGY_CONFIG = {

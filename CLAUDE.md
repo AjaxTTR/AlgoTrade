@@ -50,10 +50,11 @@ Requires `data/nq_15m_data.csv` with columns: `timestamp, open, high, low, close
 
 **Backtest:**
 - Initial capital: $100,000
-- Risk per trade: 1.5% of equity
+- Risk per trade: 0.5% of equity
 - Point value: $20 (NQ futures)
 - Commission: $2/side, slippage: 0.25 pts
-- Daily drawdown limit: 5%
+- Daily drawdown limit: 2%
+- Max daily risk: 2% (blocks new entries if cumulative risk exceeds cap)
 - Trailing stop: disabled
 
 **Strategy (First-Hour Momentum):**

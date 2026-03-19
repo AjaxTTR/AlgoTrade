@@ -39,12 +39,13 @@ STRATEGY_NAME = "first_hour_momentum"
 
 BACKTEST_CONFIG = {
     "initial_capital": 100_000.0,
-    "risk_per_trade": 0.015,        # 1.5% of equity (decimal)
+    "risk_per_trade": 0.005,        # 0.5% of equity per trade
     "point_value": 20.0,            # NQ futures: $20 per point
     "commission_per_side": 2.0,     # per contract per side
     "slippage_points": 0.25,        # adverse points per fill
     "use_trailing_stop": False,     # disable for simpler day trading
-    "daily_dd_limit": 0.05,         # 5% daily drawdown limit
+    "daily_dd_limit": 0.02,         # 2% daily drawdown limit
+    "max_daily_risk": 0.02,         # block new entries if daily risk >= 2%
     "max_dd_limit": 0.0,            # disabled for backtesting (use 0.10 live)
 }
 
