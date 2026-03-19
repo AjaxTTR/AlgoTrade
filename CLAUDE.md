@@ -1,56 +1,88 @@
 # CLAUDE.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+This file provides guidance to Claude Code when working with code in this repository.
 
 ## Project Overview
 
-Systematic trading research environment for NQ (Nasdaq 100) futures. Two components:
-
-1. **Pine Script strategy** — TradingView implementation for live chart analysis
-2. **Python backtesting framework** — Offline research engine for strategy development and evaluation
+Python backtesting framework for NQ (Nasdaq 100) futures intraday strategies. Built for systematic day-trading research — no live execution, no external APIs.
 
 ## Repository Structure
 
-- `NQ_Compression_Breakout.pine` — Pine Script v5 strategy for TradingView
-- `data_loader.py` — CSV ingestion and validation for OHLCV data
-- `strategy.py` — Strategy functions that return signal DataFrames
-- `backtester.py` — Event-loop backtest engine with position/equity tracking
-- `metrics.py` — Performance metrics (Sharpe, CAGR, etc.) and plotting
-- `main.py` — Entry point: loads data, runs strategy, prints results, generates plots
-
-## Languages & Platforms
-
-- **Pine Script v5** — TradingView Strategy Tester (paste into Pine Editor)
-- **Python 3.10+** — pandas, numpy, matplotlib
-- **Instrument:** NQ1! continuous futures, 15-minute chart
-
-## Running the Backtest
-
 ```
+main.py                              # Entry point: load data, run strategy, export results
+run_strategy.py                      # CLI wrapper to run any strategy by name
+engine/
+  data_loader.py                     # CSV ingestion and validation for OHLCV data
+  backtester.py                      # Event-loop backtest engine with position/equity tracking
+  metrics.py                         # Performance metrics (Sharpe, CAGR, etc.) and plotting
+  feature_engineering.py             # Feature computation utilities
+  prop_firm.py                       # Prop firm risk rules
+  external_data_guard.py             # Blocks accidental external data imports
+strategies/
+  first_hour_momentum.py             # First-Hour Momentum signal generator (the active strategy)
+research/
+  edge_analysis.py                   # Statistical edge discovery and conditional analysis
+  edge_to_strategy.py               # Edge-to-strategy conversion utilities
+  threshold_comparison.py            # Pullback re-entry and tier comparison runner
+  optimizer.py                       # Parallel grid search over parameter space
+  walk_forward.py                    # Walk-forward analysis for overfitting detection
+data/
+  nq_15m_data.csv                    # 7 years of NQ 15-min OHLCV (not in git)
+output/                              # All backtest artifacts land here (not in git)
+```
+
+## Running
+
+```bash
+# Full backtest (outputs to output/)
 python main.py
+
+# Grid search optimizer
+python -m research.optimizer
+
+# Walk-forward validation
+python -m research.walk_forward
 ```
 
-Requires `nq_15m_data.csv` in the project root with columns: `timestamp, open, high, low, close, volume`
+Requires `data/nq_15m_data.csv` with columns: `timestamp, open, high, low, close, volume`
 
-## Strategy Architecture (numbered pipeline)
+## Current Configuration
 
-The strategy executes as a sequential pipeline each bar:
+**Backtest:**
+- Initial capital: $100,000
+- Risk per trade: 1.5% of equity
+- Point value: $20 (NQ futures)
+- Commission: $2/side, slippage: 0.25 pts
+- Daily drawdown limit: 5%
+- Trailing stop: disabled
 
-1. **HTF Trend Filter** — Requests 4H EMA(200) and 4H close via `request.security()` to determine bullish/bearish bias (no repainting: `lookahead_off`)
-2. **Compression Detection** — ATR(14) < SMA(ATR,100) × 0.85 triggers compression; a static high/low range is locked on entry
-3. **Session Filter** — Entries restricted to US cash session 09:30–16:00 New York
-4. **Risk Controls** — Daily loss count, daily P&L %, and weekly drawdown % gates evaluated before any entry
-5. **Breakout Entry** — Close above/below compression range with max 2 attempts per phase; position sized by `equity × riskPct / stopDistance`
-6. **Asymmetric Sizing** — With-trend trades use full base risk (0.5%), counter-trend trades use half
-7. **Trade Management** — Partial TP at +2R (50% close, stop to breakeven), then ATR trailing stop ratchets remainder
-8. **State Reset** — All `var` trade-state variables reset when position goes flat
+**Strategy (First-Hour Momentum):**
+- Edge: FH_Up -> Rest_Up (t=30.38, stability=0.946), long only
+- First-hour window: 09:30-10:30 ET
+- Bias filter: top 20% first-hour moves (80th percentile, expanding window)
+- Session: 09:30-16:00 ET, entry cutoff 15:45
+- ATR period: 14, stop at 1.5x ATR, TP at 2.0x ATR
+- Holding period: 8 bars (2 hours on 15-min bars)
+- Pullback re-entries: 0.5 ATR dip from session high + upper-half close
+- Max 3 trades/day (1 initial + up to 2 pullback re-entries)
+
+## Strategy Pipeline
+
+1. **First-Hour Observation** — Measure return from 09:30-10:30 (open to close)
+2. **Bias Filter** — Only trade if first-hour return exceeds 80th percentile of prior days (expanding window, no lookahead)
+3. **Initial Entry** — Signal on first bar at/after 10:30, fill at 10:45 open (long only)
+4. **Pullback Re-entries** — After each trade's holding-period exit, re-enter on pullback bars (dip >= 0.5 ATR from session high, bar closes in upper half)
+5. **Risk Sizing** — ATR-based volatility sizing: equity * risk_per_trade / (ATR * point_value), supports size_factor column
+6. **Trade Management** — Stop at 1.5x ATR below entry, TP at 2.0x ATR above; 8-bar holding period exit via session_close flag
+7. **Daily Limits** — Max 3 trades/day, 5% daily drawdown limit enforced
 
 ## Key Conventions
 
-- All per-trade state uses Pine Script `var` variables (persist across bars, reset on flat)
-- `pendingStop` captures the compression boundary on the signal bar; `entryConfirmed` flag gates recalculation using the actual fill price from `strategy.position_avg_price`
-- Stop distances and R-values are recalculated from the real fill price, not the signal bar close
-- Position sizing floors to whole contracts (`math.floor`); trades with < 1 contract are skipped
+- All output files go to `output/` (trade_log.csv, equity_curve.csv, drawdown_series.csv, performance_metrics.json, backtest_results.png)
+- No external API calls — data is loaded from local CSV only
+- Strategy modules expose `generate_signals(df, **params) -> DataFrame`
+- Backtester config and strategy config are separate dicts in main.py
+- Research tools (optimizer, walk_forward) share synced config with main.py
 
 ## Git Workflow
 

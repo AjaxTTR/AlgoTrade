@@ -8,7 +8,7 @@ research/results.csv.
 Usage:
     python -m research.optimizer [strategy_name]
 
-If no strategy name is provided, defaults to "opening_range_breakout".
+If no strategy name is provided, defaults to "first_hour_momentum".
 """
 
 import importlib
@@ -37,17 +37,27 @@ DATA_FILE = "data/nq_15m_data.csv"
 
 BACKTEST_CONFIG = {
     "initial_capital": 100_000.0,
-    "risk_per_trade": 0.005,
+    "risk_per_trade": 0.015,
     "point_value": 20.0,
     "commission_per_side": 2.0,
     "slippage_points": 0.25,
 }
 
+BASE_STRATEGY_CONFIG = {
+    "session_start": "09:30",
+    "session_end": "16:00",
+    "fh_end": "10:30",
+    "entry_cutoff": "15:45",
+    "fh_percentile": 80.0,
+    "atr_period": 14,
+    "holding_bars": 8,
+}
+
 PARAM_GRID = {
-    "orb_minutes": [15, 30, 45],
-    "tp_atr_multiple": [1.5, 2.0, 2.5, 3.0],
-    "min_orb_atr_ratio": [0.2, 0.3, 0.5],
-    "trade_window_end": ["10:30", "11:00", "11:30"],
+    "stop_atr_multiple": [1.0, 1.5, 2.0],
+    "tp_atr_multiple": [1.5, 2.0, 3.0],
+    "max_trades_per_day": [1, 2, 3],
+    "pullback_atr_frac": [0.3, 0.5, 0.75],
 }
 
 # Multi-metric scoring configuration
@@ -59,7 +69,7 @@ SCORING = {
     },
     "filters": {
         "max_drawdown_threshold": -25.0,   # reject combos with DD worse than -25%
-        "min_trades": 20,                   # reject combos with fewer trades
+        "min_trades": 100,                  # reject combos with fewer trades
     },
 }
 
@@ -120,17 +130,19 @@ def _evaluate_combo(args: tuple) -> dict:
 
     from engine.data_loader import load_csv
     from engine.backtester import run
-    from engine.metrics import compute_metrics
+    from engine.metrics import compute_metrics, validate_strategy
 
     try:
         df = load_csv(data_file)
         strategy_module = importlib.import_module(f"strategies.{strategy_name}")
-        signals = strategy_module.generate_signals(df.copy(), **params)
+        merged_params = {**BASE_STRATEGY_CONFIG, **params}
+        signals = strategy_module.generate_signals(df.copy(), **merged_params)
         bt_result = run(signals, **BACKTEST_CONFIG)
         metrics = compute_metrics(bt_result, initial_capital=BACKTEST_CONFIG["initial_capital"])
 
         mtm = metrics["mtm"]
         trades = metrics["trades"]
+        validation = validate_strategy(metrics)
 
         return {
             "strategy_name": strategy_name,
@@ -142,6 +154,8 @@ def _evaluate_combo(args: tuple) -> dict:
             "max_drawdown": mtm["max_drawdown"],
             "profit_factor": trades["profit_factor"],
             "trades": trades["total_trades"],
+            "valid": validation["passed"],
+            "validation_failures": len(validation["failures"]),
         }
 
     except Exception as exc:
@@ -155,6 +169,8 @@ def _evaluate_combo(args: tuple) -> dict:
             "max_drawdown": None,
             "profit_factor": None,
             "trades": 0,
+            "valid": False,
+            "validation_failures": -1,
             "error": str(exc),
         }
 
@@ -163,8 +179,31 @@ def _evaluate_combo(args: tuple) -> dict:
 # Main
 # ---------------------------------------------------------------------------
 
-def optimize(strategy_name: str = "opening_range_breakout") -> pd.DataFrame:
-    """Run grid search in parallel and return a DataFrame of results."""
+def optimize(
+    strategy_name: str = "first_hour_momentum",
+    skip_validation: bool = False,
+    skip_edge_check: bool = False,
+    validation_thresholds: dict | None = None,
+    edge_thresholds: dict | None = None,
+) -> pd.DataFrame:
+    """Run grid search in parallel and return a DataFrame of results.
+
+    Parameters
+    ----------
+    strategy_name : str
+        Strategy module name under strategies/.
+    skip_validation : bool
+        If True, skip the baseline backtest validation gate (default False).
+    skip_edge_check : bool
+        If True, skip the edge prerequisite check (default False).
+        When False, the optimizer runs a fast statistical scan of the data
+        to confirm at least one significant, stable edge exists before
+        committing to the grid search.
+    validation_thresholds : dict | None
+        Override default validation thresholds for the baseline check.
+    edge_thresholds : dict | None
+        Override default thresholds for the edge prerequisite check.
+    """
     t_start = time.perf_counter()
 
     # Validate data file exists before spawning workers
@@ -181,6 +220,62 @@ def optimize(strategy_name: str = "opening_range_breakout") -> pd.DataFrame:
     if not hasattr(mod, "generate_signals"):
         log.error("Strategy '%s' missing generate_signals().", strategy_name)
         sys.exit(1)
+
+    # --- Edge prerequisite gate (hard stop) ---
+    if not skip_edge_check:
+        from research.edge_analysis import check_edge_prerequisites
+
+        log.info("Running edge prerequisite check on raw data...")
+        try:
+            edge_result = check_edge_prerequisites(
+                data_file=DATA_FILE,
+                thresholds=edge_thresholds,
+            )
+            if not edge_result["passed"]:
+                log.error(
+                    "EDGE CHECK FAILED: no qualifying statistical edge found. "
+                    "Optimisation aborted. Use skip_edge_check=True to override."
+                )
+                for reason in edge_result["failures"]:
+                    log.error("  %s", reason)
+                return pd.DataFrame()
+            log.info(
+                "Edge check PASSED: %d qualifying edge(s) confirmed.",
+                edge_result["n_significant"],
+            )
+        except Exception as exc:
+            log.warning("Edge prerequisite check could not run: %s", exc)
+            log.warning("Proceeding with optimisation (edge check inconclusive).")
+
+    # --- Baseline backtest validation gate (soft warning) ---
+    if not skip_validation:
+        from engine.data_loader import load_csv
+        from engine.backtester import run as run_backtest
+        from engine.metrics import compute_metrics, validate_strategy, print_validation
+
+        log.info("Running baseline validation with default parameters...")
+        df_val = load_csv(DATA_FILE)
+        # Use the first set of values from the grid as baseline
+        baseline_params = {k: v[0] for k, v in PARAM_GRID.items()}
+        merged = {**BASE_STRATEGY_CONFIG, **baseline_params}
+        try:
+            signals = mod.generate_signals(df_val.copy(), **merged)
+            result = run_backtest(signals, **BACKTEST_CONFIG)
+            metrics = compute_metrics(result, initial_capital=BACKTEST_CONFIG["initial_capital"])
+            validation = validate_strategy(metrics, thresholds=validation_thresholds)
+            print_validation(validation)
+
+            if not validation["passed"]:
+                log.warning(
+                    "Baseline validation FAILED (%d/%d checks). "
+                    "Strategy may not be worth optimising. "
+                    "Use skip_validation=True to override.",
+                    validation["checks_passed"], validation["checks_run"],
+                )
+                # Still continue — the grid may find passing combos
+                # but warn loudly so the user is aware
+        except Exception as exc:
+            log.warning("Baseline validation could not run: %s", exc)
 
     # Build parameter combinations
     combos = _build_combos(PARAM_GRID)
@@ -233,11 +328,26 @@ def optimize(strategy_name: str = "opening_range_breakout") -> pd.DataFrame:
     print(f"  Scoring weights: {SCORING['weights']}")
     print(f"  Filters: {SCORING['filters']}")
     print(f"  Total combinations: {total}  |  Workers: {n_workers}  |  Runtime: {elapsed:.1f}s")
+
+    # Validation summary
+    if "valid" in results_df.columns:
+        n_valid = int(results_df["valid"].sum())
+        n_invalid = total - n_valid
+        print(f"\n  Validation: {n_valid}/{total} combos passed  |  {n_invalid} rejected")
+        if n_valid == 0:
+            print("  WARNING: No parameter combination passed validation.")
+
     print("=" * 100 + "\n")
 
     return results_df
 
 
 if __name__ == "__main__":
-    name = sys.argv[1] if len(sys.argv) > 1 else "opening_range_breakout"
-    optimize(name)
+    args = [a for a in sys.argv[1:] if not a.startswith("--")]
+    flags = [a for a in sys.argv[1:] if a.startswith("--")]
+    name = args[0] if args else "first_hour_momentum"
+    optimize(
+        name,
+        skip_edge_check="--skip-edge-check" in flags,
+        skip_validation="--skip-validation" in flags,
+    )

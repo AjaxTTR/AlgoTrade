@@ -5,7 +5,7 @@ import seaborn as sns
 import matplotlib.pyplot as plt
 
 
-def plot_surface(results, param_x="orb_minutes", param_y="tp_atr_multiple", metric="sharpe"):
+def plot_surface(results, param_x="stop_atr_multiple", param_y="tp_atr_multiple", metric="sharpe"):
     pivot = results.pivot_table(
         values=metric,
         index=param_x,
@@ -35,7 +35,7 @@ if __name__ == "__main__":
 
     plot_surface(
         results,
-        param_x="orb_minutes",
+        param_x="stop_atr_multiple",
         param_y="tp_atr_multiple",
         metric="sharpe",
     )

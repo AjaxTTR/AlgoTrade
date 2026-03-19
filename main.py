@@ -1,12 +1,12 @@
 """
-Main entry point for the NQ Opening Range Breakout backtesting framework.
+Main entry point for the NQ First-Hour Momentum backtesting framework.
 
 Usage:
     python main.py
 
-Expects nq_15m_data.csv in the same directory.
-Outputs: trade_log.csv, equity_curve.csv, drawdown_series.csv,
-         performance_metrics.json, backtest_results.png
+Expects data/nq_15m_data.csv.
+Outputs land in output/: trade_log.csv, equity_curve.csv, drawdown_series.csv,
+                         performance_metrics.json, backtest_results.png
 """
 
 import importlib
@@ -21,7 +21,7 @@ import pandas as pd
 
 from engine.data_loader import load_csv
 from engine.backtester import run
-from engine.metrics import compute_metrics, print_metrics, plot_results
+from engine.metrics import compute_metrics, print_metrics, plot_results, validate_strategy, print_validation
 
 logging.basicConfig(
     level=logging.INFO,
@@ -35,38 +35,34 @@ log = logging.getLogger(__name__)
 # Configuration
 # ---------------------------------------------------------------------------
 DATA_FILE = "data/nq_15m_data.csv"
-STRATEGY_NAME = "opening_range_breakout"
+STRATEGY_NAME = "first_hour_momentum"
 
 BACKTEST_CONFIG = {
     "initial_capital": 100_000.0,
-    "risk_per_trade": 0.005,        # 0.5% of equity (decimal)
+    "risk_per_trade": 0.015,        # 1.5% of equity (decimal)
     "point_value": 20.0,            # NQ futures: $20 per point
     "commission_per_side": 2.0,     # per contract per side
     "slippage_points": 0.25,        # adverse points per fill
-    "use_trailing_stop": True,      # enable partial TP + trailing stop
-    "trail_atr_multiple": 2.0,      # ATR multiplier for trail distance
-    "partial_tp_pct": 0.5,          # close 50% at TP
-    "move_stop_to_be": True,        # move stop to breakeven after partial
+    "use_trailing_stop": False,     # disable for simpler day trading
+    "daily_dd_limit": 0.05,         # 5% daily drawdown limit
+    "max_dd_limit": 0.0,            # disabled for backtesting (use 0.10 live)
 }
 
 STRATEGY_CONFIG = {
-    "orb_minutes": 30,
     "session_start": "09:30",
     "session_end": "16:00",
-    "entry_cutoff": "14:30",
+    "fh_end": "10:30",
+    "entry_cutoff": "15:45",
+    "fh_percentile": 80.0,          # top 20% first-hour moves
     "atr_period": 14,
+    "stop_atr_multiple": 1.5,
     "tp_atr_multiple": 2.0,
-    "min_orb_atr_ratio": 0.3,
-    "use_vwap_filter": True,
-    "min_atr_percent": 0.003,
-    "min_gap_atr_ratio": 0.25,
-    "trade_window_start": "09:30",
-    "trade_window_end": "11:00",
-    "max_trades_per_day": 1,
-    "atr_ma_period": 50,
+    "holding_bars": 8,              # 2 hours on 15-min bars
+    "max_trades_per_day": 3,        # initial + pullback re-entries
+    "pullback_atr_frac": 0.5,       # min pullback depth from session high
 }
 
-OUTPUT_DIR = Path(".")
+OUTPUT_DIR = Path("output")
 
 
 # ---------------------------------------------------------------------------
@@ -123,7 +119,7 @@ def main() -> None:
     t_start = time.perf_counter()
 
     print("\n" + "=" * 62)
-    print("  NQ OPENING RANGE BREAKOUT — BACKTEST")
+    print("  NQ FIRST-HOUR MOMENTUM -- BACKTEST")
     print("=" * 62)
 
     _print_config("Backtest Configuration", BACKTEST_CONFIG)
@@ -182,13 +178,18 @@ def main() -> None:
     metrics = compute_metrics(result, initial_capital=BACKTEST_CONFIG["initial_capital"])
     print_metrics(metrics)
 
+    # --- Validation ---
+    validation = validate_strategy(metrics)
+    print_validation(validation)
+
     # --- Export ---
+    OUTPUT_DIR.mkdir(exist_ok=True)
     _export_trades(result.trades, OUTPUT_DIR / "trade_log.csv")
     _export_results(result, metrics, OUTPUT_DIR)
 
     # --- Plots ---
     log.info("Generating plots")
-    plot_results(result, metrics)
+    plot_results(result, metrics, output_dir=str(OUTPUT_DIR))
 
     # --- Runtime summary ---
     elapsed = time.perf_counter() - t_start

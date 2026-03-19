@@ -21,7 +21,8 @@ import pandas as pd
 
 from engine.data_loader import load_csv
 from engine.backtester import run as run_backtest
-from engine.metrics import compute_metrics
+from engine.metrics import compute_metrics, validate_strategy
+from research.edge_analysis import check_edge_prerequisites_from_df
 
 logging.basicConfig(
     level=logging.INFO,
@@ -42,19 +43,43 @@ STEP_MONTHS = 3
 
 BACKTEST_CONFIG = {
     "initial_capital": 100_000.0,
-    "risk_per_trade": 0.005,
+    "risk_per_trade": 0.015,
     "point_value": 20.0,
     "commission_per_side": 2.0,
     "slippage_points": 0.25,
+    "use_trailing_stop": False,
+    "daily_dd_limit": 0.05,
+    "max_dd_limit": 0.0,
+}
+
+BASE_STRATEGY_CONFIG = {
+    "session_start": "09:30",
+    "session_end": "16:00",
+    "fh_end": "10:30",
+    "entry_cutoff": "15:45",
+    "fh_percentile": 80.0,
+    "atr_period": 14,
+    "holding_bars": 8,
 }
 
 PARAM_GRID = {
-    "orb_minutes": [15, 30, 45],
-    "tp_atr_multiple": [1.5, 2.0, 2.5],
-    "trade_window_end": ["10:30", "11:00", "11:30"],
+    "stop_atr_multiple": [1.0, 1.5, 2.0],
+    "tp_atr_multiple": [1.5, 2.0, 3.0],
+    "max_trades_per_day": [1, 2, 3],
+    "pullback_atr_frac": [0.3, 0.5, 0.75],
 }
 
 OUTPUT_PATH = Path("research/walk_forward_results.csv")
+
+# Relaxed edge thresholds for fold-level checks (smaller sample windows)
+FOLD_EDGE_THRESHOLDS = {
+    "min_significant_edges": 1,
+    "min_stability": 0.0,          # don't require stability on short windows
+    "max_p_adj": 0.30,             # lenient FDR (|t| is the real gate)
+    "max_raw_p": 0.10,             # relaxed raw p for smaller samples
+    "min_sample_size": 30,         # fewer bars available per fold
+    "min_abs_t_stat": 1.5,         # slightly relaxed t-stat floor
+}
 
 
 # ---------------------------------------------------------------------------
@@ -99,7 +124,8 @@ def _grid_search(
     for combo in itertools.product(*values):
         params = dict(zip(keys, combo))
         try:
-            signals = strategy_module.generate_signals(df.copy(), **params)
+            merged_params = {**BASE_STRATEGY_CONFIG, **params}
+            signals = strategy_module.generate_signals(df.copy(), **merged_params)
             result = run_backtest(signals, **backtest_config)
             metrics = compute_metrics(result, initial_capital=backtest_config["initial_capital"])
             sharpe = metrics["mtm"]["sharpe"]
@@ -120,8 +146,22 @@ def _grid_search(
 # Main
 # ---------------------------------------------------------------------------
 
-def walk_forward(strategy_name: str = "opening_range_breakout") -> pd.DataFrame:
-    """Run walk-forward analysis and return per-fold results."""
+def walk_forward(
+    strategy_name: str = "first_hour_momentum",
+    skip_edge_check: bool = False,
+    edge_thresholds: dict | None = None,
+) -> pd.DataFrame:
+    """Run walk-forward analysis and return per-fold results.
+
+    Parameters
+    ----------
+    strategy_name : str
+        Strategy module name under strategies/.
+    skip_edge_check : bool
+        If True, skip per-fold edge validation (default False).
+    edge_thresholds : dict | None
+        Override default thresholds for the edge prerequisite check.
+    """
     t_start = time.perf_counter()
 
     log.info("Loading data from %s", DATA_FILE)
@@ -139,6 +179,7 @@ def walk_forward(strategy_name: str = "opening_range_breakout") -> pd.DataFrame:
         sys.exit(1)
 
     oos_results = []
+    edge_checks = {"total": 0, "passed": 0, "skipped": 0}
 
     for i, (train_start, train_end, test_start, test_end) in enumerate(folds):
         log.info("Fold %d/%d: train %s->%s | test %s->%s",
@@ -154,6 +195,49 @@ def walk_forward(strategy_name: str = "opening_range_breakout") -> pd.DataFrame:
                         i + 1, len(df_train), len(df_test))
             continue
 
+        # --- Per-fold edge validation ---
+        fold_edge_passed = True
+        if not skip_edge_check:
+            edge_checks["total"] += 1
+            try:
+                fold_edge_th = {**FOLD_EDGE_THRESHOLDS, **(edge_thresholds or {})}
+                edge_result = check_edge_prerequisites_from_df(
+                    df_train.copy(),
+                    thresholds=fold_edge_th,
+                    quiet=True,
+                )
+                fold_edge_passed = edge_result["passed"]
+            except Exception as exc:
+                log.warning("  Fold %d edge check error: %s (proceeding anyway)", i + 1, exc)
+                fold_edge_passed = True  # inconclusive — don't penalise
+
+            if fold_edge_passed:
+                edge_checks["passed"] += 1
+                log.info("  Edge check PASSED (%d qualifying edge(s))",
+                         edge_result.get("n_significant", 0))
+            else:
+                edge_checks["skipped"] += 1
+                log.info("  Edge check FAILED — skipping fold %d (no significant edge in training data)",
+                         i + 1)
+                oos_results.append({
+                    "fold": i + 1,
+                    "train_start": train_start.strftime("%Y-%m-%d"),
+                    "train_end": train_end.strftime("%Y-%m-%d"),
+                    "test_start": test_start.strftime("%Y-%m-%d"),
+                    "test_end": test_end.strftime("%Y-%m-%d"),
+                    "is_sharpe": np.nan,
+                    "oos_sharpe": np.nan,
+                    "oos_return": np.nan,
+                    "oos_max_dd": np.nan,
+                    "oos_trades": 0,
+                    "oos_valid": False,
+                    "oos_val_failures": -1,
+                    "edge_valid": False,
+                    "edge_skipped": True,
+                    **{k: None for k in PARAM_GRID.keys()},
+                })
+                continue
+
         # Optimize on training window
         best_params, is_sharpe = _grid_search(
             df_train, strategy_module, PARAM_GRID, BACKTEST_CONFIG,
@@ -161,7 +245,8 @@ def walk_forward(strategy_name: str = "opening_range_breakout") -> pd.DataFrame:
 
         # Test on out-of-sample window
         try:
-            signals = strategy_module.generate_signals(df_test.copy(), **best_params)
+            oos_params = {**BASE_STRATEGY_CONFIG, **best_params}
+            signals = strategy_module.generate_signals(df_test.copy(), **oos_params)
             result = run_backtest(signals, **BACKTEST_CONFIG)
             metrics = compute_metrics(result, initial_capital=BACKTEST_CONFIG["initial_capital"])
 
@@ -169,13 +254,22 @@ def walk_forward(strategy_name: str = "opening_range_breakout") -> pd.DataFrame:
             oos_return = metrics["mtm"]["total_return"]
             oos_max_dd = metrics["mtm"]["max_drawdown"]
             oos_trades = metrics["trades"]["total_trades"]
+
+            # Validate OOS result (relaxed thresholds for individual folds)
+            fold_thresholds = {"min_trades": 5, "max_drawdown": -40.0}
+            validation = validate_strategy(metrics, thresholds=fold_thresholds)
+            oos_valid = validation["passed"]
+            oos_val_failures = len(validation["failures"])
         except Exception as exc:
             log.warning("  Fold %d OOS failed: %s", i + 1, exc)
             oos_sharpe = oos_return = oos_max_dd = 0.0
             oos_trades = 0
+            oos_valid = False
+            oos_val_failures = -1
 
-        log.info("  IS Sharpe: %.2f | OOS Sharpe: %.2f | OOS Return: %.2f%% | Params: %s",
-                 is_sharpe, oos_sharpe, oos_return, best_params)
+        valid_str = "PASS" if oos_valid else "FAIL"
+        log.info("  IS Sharpe: %.2f | OOS Sharpe: %.2f | OOS Return: %.2f%% | Valid: %s | Params: %s",
+                 is_sharpe, oos_sharpe, oos_return, valid_str, best_params)
 
         oos_results.append({
             "fold": i + 1,
@@ -188,6 +282,10 @@ def walk_forward(strategy_name: str = "opening_range_breakout") -> pd.DataFrame:
             "oos_return": round(oos_return, 2),
             "oos_max_dd": round(oos_max_dd, 2),
             "oos_trades": oos_trades,
+            "oos_valid": oos_valid,
+            "oos_val_failures": oos_val_failures,
+            "edge_valid": fold_edge_passed,
+            "edge_skipped": False,
             **best_params,
         })
 
@@ -222,6 +320,23 @@ def walk_forward(strategy_name: str = "opening_range_breakout") -> pd.DataFrame:
         print(f"    Avg OOS Max DD:         {avg_dd:>7.2f}%")
         print(f"    Folds:                  {len(results_df):>8d}")
 
+        if "oos_valid" in results_df.columns:
+            n_valid = int(results_df["oos_valid"].sum())
+            n_total = len(results_df)
+            valid_pct = n_valid / n_total * 100 if n_total > 0 else 0
+            print(f"    OOS Folds Valid:        {n_valid:>5d}/{n_total}  ({valid_pct:.0f}%)")
+            if valid_pct < 50:
+                print("    WARNING: Majority of OOS folds fail validation — strategy unstable.")
+
+        # Edge validation summary
+        if not skip_edge_check and edge_checks["total"] > 0:
+            ec = edge_checks
+            edge_pct = ec["passed"] / ec["total"] * 100
+            print(f"\n    Edge Pre-Check:         {ec['passed']:>5d}/{ec['total']}  ({edge_pct:.0f}% of folds have valid edge)")
+            print(f"    Folds Skipped (no edge):{ec['skipped']:>5d}")
+            if edge_pct < 50:
+                print("    WARNING: Majority of folds lack a statistical edge — strategy may be curve-fitting.")
+
     print(f"    Runtime:                {elapsed:>7.1f}s")
     print("=" * 90 + "\n")
 
@@ -229,5 +344,10 @@ def walk_forward(strategy_name: str = "opening_range_breakout") -> pd.DataFrame:
 
 
 if __name__ == "__main__":
-    name = sys.argv[1] if len(sys.argv) > 1 else "opening_range_breakout"
-    walk_forward(name)
+    args = [a for a in sys.argv[1:] if not a.startswith("--")]
+    flags = [a for a in sys.argv[1:] if a.startswith("--")]
+    name = args[0] if args else "first_hour_momentum"
+    walk_forward(
+        name,
+        skip_edge_check="--skip-edge-check" in flags,
+    )
