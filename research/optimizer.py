@@ -37,12 +37,17 @@ DATA_FILE = "data/nq_15m_data.csv"
 
 BACKTEST_CONFIG = {
     "initial_capital": 100_000.0,
-    "risk_per_trade": 0.01,
+    "risk_per_trade": 0.005,
     "point_value": 20.0,
     "commission_per_side": 2.0,
     "slippage_points": 0.25,
     "daily_dd_limit": 0.02,
     "max_daily_risk": 0.02,
+    "max_bars_in_trade": 8,
+    "max_concurrent_trades": 1,
+    "min_bars_between_entries": 2,
+    "consec_loss_threshold": 2,
+    "loss_scale_down": 0.5,
 }
 
 BASE_STRATEGY_CONFIG = {
@@ -53,13 +58,14 @@ BASE_STRATEGY_CONFIG = {
     "fh_percentile": 80.0,
     "atr_period": 14,
     "holding_bars": 8,
+    "pullback_atr_frac": 1.0,
+    "min_bars_between_entries": 2,
 }
 
 PARAM_GRID = {
     "stop_atr_multiple": [1.0, 1.5, 2.0],
     "tp_atr_multiple": [1.5, 2.0, 3.0],
-    "max_trades_per_day": [1, 2, 3],
-    "pullback_atr_frac": [0.3, 0.5, 0.75],
+    "max_trades_per_day": [2, 3, 4],
 }
 
 # Multi-metric scoring configuration
@@ -70,8 +76,8 @@ SCORING = {
         "profit_factor": 0.2,
     },
     "filters": {
-        "max_drawdown_threshold": -25.0,   # reject combos with DD worse than -25%
-        "min_trades": 100,                  # reject combos with fewer trades
+        "max_drawdown_threshold": -15.0,   # reject combos with DD worse than -15%
+        "min_trades": 30,                   # reject combos with fewer trades
     },
 }
 

@@ -40,14 +40,19 @@ STRATEGY_NAME = "first_hour_momentum"
 
 BACKTEST_CONFIG = {
     "initial_capital": 100_000.0,
-    "risk_per_trade": 0.01,         # 1% of equity per trade
+    "risk_per_trade": 0.005,        # 0.5% of equity per trade
     "point_value": 20.0,            # NQ futures: $20 per point
     "commission_per_side": 2.0,     # per contract per side
     "slippage_points": 0.25,        # adverse points per fill
     "use_trailing_stop": False,     # disable for simpler day trading
-    "daily_dd_limit": 0.02,         # 2% daily drawdown limit
+    "daily_dd_limit": 0.02,         # 2% daily drawdown limit — stop trading
     "max_daily_risk": 0.02,         # block new entries if daily risk >= 2%
     "max_dd_limit": 0.0,            # disabled for backtesting (use 0.10 live)
+    "max_bars_in_trade": 8,         # holding period exit (8 bars = 2 hours)
+    "max_concurrent_trades": 1,     # single active trade at a time
+    "min_bars_between_entries": 2,  # min bars between consecutive fills
+    "consec_loss_threshold": 2,     # scale down after 2 consecutive losses
+    "loss_scale_down": 0.5,         # halve size during drawdown
 }
 
 STRATEGY_CONFIG = {
@@ -60,8 +65,9 @@ STRATEGY_CONFIG = {
     "stop_atr_multiple": 1.5,
     "tp_atr_multiple": 2.0,
     "holding_bars": 8,              # 2 hours on 15-min bars
-    "max_trades_per_day": 3,        # initial + pullback re-entries
-    "pullback_atr_frac": 0.5,       # min pullback depth from session high
+    "max_trades_per_day": 4,        # initial + pullback re-entries + midday continuation
+    "pullback_atr_frac": 1.0,       # min pullback depth: 1 ATR from session high
+    "min_bars_between_entries": 2,  # signal spacing for overlapping entries
 }
 
 PROP_FIRM_CONFIGS = {
@@ -212,7 +218,7 @@ def main() -> None:
     log.info("Running prop firm simulations")
     prop_results = {}
     for firm_name, firm_cfg in PROP_FIRM_CONFIGS.items():
-        pf = simulate_prop_firm(result, config=firm_cfg, n_simulations=500, seed=42)
+        pf = simulate_prop_firm(result, config=firm_cfg, n_simulations=5000, seed=42)
         prop_results[firm_name] = pf
         print_prop_firm(pf)
 
@@ -241,6 +247,12 @@ def main() -> None:
     print(f"    Bars processed:      {n_bars:>10,}")
     print(f"    Signals generated:   {n_signals:>10,}")
     print(f"    Trades completed:    {n_trades:>10,}")
+    print(f"    Max concurrent:      {result.max_concurrent_positions:>10d}")
+    if result.daily_trade_counts:
+        avg_daily = sum(result.daily_trade_counts.values()) / len(result.daily_trade_counts)
+        max_daily = max(result.daily_trade_counts.values())
+        print(f"    Avg trades/day:      {avg_daily:>10.1f}")
+        print(f"    Max trades/day:      {max_daily:>10d}")
     print(f"    Runtime:             {elapsed:>10.2f} s")
     print("=" * 62 + "\n")
 

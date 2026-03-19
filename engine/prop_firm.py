@@ -6,6 +6,7 @@ by stepping through trades against configurable rules, with Monte Carlo
 shuffling to estimate pass rates across random trade orderings.
 """
 
+import math
 import numpy as np
 import pandas as pd
 from engine.backtester import BacktestResult
@@ -132,10 +133,26 @@ def _days_between(d1, d2) -> int:
     return max(0, delta.days)
 
 
+def _wilson_ci(n_success: int, n_total: int, z: float = 1.96) -> tuple[float, float]:
+    """Wilson score confidence interval for a binomial proportion.
+
+    Returns (lower, upper) as percentages (0-100).
+    """
+    if n_total == 0:
+        return (0.0, 0.0)
+    p = n_success / n_total
+    denom = 1 + z * z / n_total
+    centre = p + z * z / (2 * n_total)
+    spread = z * math.sqrt((p * (1 - p) + z * z / (4 * n_total)) / n_total)
+    lo = max(0.0, (centre - spread) / denom)
+    hi = min(1.0, (centre + spread) / denom)
+    return (round(lo * 100, 2), round(hi * 100, 2))
+
+
 def simulate_prop_firm(
     result: BacktestResult,
     config: dict | None = None,
-    n_simulations: int = 500,
+    n_simulations: int = 5000,
     seed: int | None = None,
 ) -> dict:
     """Monte Carlo prop firm challenge simulation.
@@ -152,15 +169,16 @@ def simulate_prop_firm(
     config : dict | None
         Prop firm rules. Uses DEFAULT_CONFIG if None.
     n_simulations : int
-        Number of shuffled simulations (default 500).
+        Number of shuffled simulations (default 5000).
     seed : int | None
         RNG seed for reproducibility.
 
     Returns
     -------
     dict
-        pass_rate, fail_rate, avg_days_to_pass, classification,
-        fail_reasons, drawdown_distribution, percentiles, simulations.
+        pass_rate, fail_rate, pass_rate_ci, avg_days_to_pass,
+        classification, fail_reasons, equity_distribution,
+        drawdown_distribution, actual, n_simulations, config.
     """
     cfg = {**DEFAULT_CONFIG, **(config or {})}
     trades = result.trades
@@ -179,6 +197,12 @@ def simulate_prop_firm(
     # Cumulative index boundaries for assigning shuffled trades to days
     day_boundaries = np.concatenate([[0], np.cumsum(trades_per_day)])
 
+    # Precompute date mapping for shuffled trades (same for all sims)
+    shuffled_dates_template = np.empty(len(pnls), dtype=exit_dates.dtype)
+    for d_idx, d in enumerate(unique_dates):
+        start, end = day_boundaries[d_idx], day_boundaries[d_idx + 1]
+        shuffled_dates_template[start:end] = d
+
     # Run actual (unshuffled) first
     actual = _simulate_single(pnls, exit_dates, cfg)
 
@@ -187,23 +211,27 @@ def simulate_prop_firm(
     for _ in range(n_simulations):
         shuffled_idx = rng.permutation(len(pnls))
         shuffled_pnls = pnls[shuffled_idx]
-        # Map shuffled trades back onto the original date structure
-        shuffled_dates = np.empty(len(pnls), dtype=exit_dates.dtype)
-        for d_idx, d in enumerate(unique_dates):
-            start, end = day_boundaries[d_idx], day_boundaries[d_idx + 1]
-            shuffled_dates[start:end] = d
-        sims.append(_simulate_single(shuffled_pnls, shuffled_dates, cfg))
+        sims.append(_simulate_single(shuffled_pnls, shuffled_dates_template, cfg))
 
     # Aggregate results
     outcomes = [s["outcome"] for s in sims]
     n_pass = sum(1 for o in outcomes if o == "PASS")
     pass_rate = n_pass / n_simulations * 100
 
+    # Pass rate confidence interval (95% Wilson score)
+    pass_rate_ci = _wilson_ci(n_pass, n_simulations, z=1.96)
+
     pass_days = [s["days_elapsed"] for s in sims if s["outcome"] == "PASS"]
     avg_days_to_pass = float(np.mean(pass_days)) if pass_days else 0.0
 
+    # Percentile breakdown: drawdown distribution
+    pctiles = [5, 25, 50, 75, 95]
     peak_dds = np.array([s["peak_dd_pct"] for s in sims])
-    dd_pcts = np.percentile(peak_dds, [5, 50, 95])
+    dd_pct_vals = np.percentile(peak_dds, pctiles)
+
+    # Percentile breakdown: final equity distribution
+    final_equities = np.array([s["final_equity"] for s in sims])
+    eq_pct_vals = np.percentile(final_equities, pctiles)
 
     fail_reasons = {}
     for s in sims:
@@ -220,15 +248,17 @@ def simulate_prop_firm(
         classification = "UNVIABLE"
 
     return {
-        "pass_rate": round(pass_rate, 1),
-        "fail_rate": round(100 - pass_rate, 1),
+        "pass_rate": round(pass_rate, 2),
+        "fail_rate": round(100 - pass_rate, 2),
+        "pass_rate_ci": pass_rate_ci,
         "avg_days_to_pass": round(avg_days_to_pass, 1),
         "classification": classification,
         "fail_reasons": fail_reasons,
+        "equity_distribution": {
+            f"eq_p{p}": round(float(v), 2) for p, v in zip(pctiles, eq_pct_vals)
+        },
         "drawdown_distribution": {
-            "dd_p5": round(float(dd_pcts[0]), 2),
-            "dd_p50": round(float(dd_pcts[1]), 2),
-            "dd_p95": round(float(dd_pcts[2]), 2),
+            f"dd_p{p}": round(float(v), 2) for p, v in zip(pctiles, dd_pct_vals)
         },
         "actual": actual,
         "n_simulations": n_simulations,
@@ -241,10 +271,18 @@ def _empty_result(cfg: dict) -> dict:
     return {
         "pass_rate": 0.0,
         "fail_rate": 100.0,
+        "pass_rate_ci": (0.0, 0.0),
         "avg_days_to_pass": 0.0,
         "classification": "UNVIABLE",
         "fail_reasons": {"insufficient_trades": 1},
-        "drawdown_distribution": {"dd_p5": 0.0, "dd_p50": 0.0, "dd_p95": 0.0},
+        "equity_distribution": {
+            "eq_p5": 0.0, "eq_p25": 0.0, "eq_p50": 0.0,
+            "eq_p75": 0.0, "eq_p95": 0.0,
+        },
+        "drawdown_distribution": {
+            "dd_p5": 0.0, "dd_p25": 0.0, "dd_p50": 0.0,
+            "dd_p75": 0.0, "dd_p95": 0.0,
+        },
         "actual": {"outcome": "FAIL", "reason": "insufficient_trades",
                    "final_equity": cfg["starting_balance"], "peak_dd_pct": 0.0,
                    "days_elapsed": 0, "trades_taken": 0},
@@ -257,7 +295,9 @@ def print_prop_firm(pf: dict) -> None:
     """Pretty-print prop firm simulation results."""
     cfg = pf["config"]
     dd = pf["drawdown_distribution"]
+    eq = pf["equity_distribution"]
     actual = pf["actual"]
+    ci = pf["pass_rate_ci"]
 
     print("\n" + "=" * 62)
     print("  PROP FIRM CHALLENGE SIMULATION")
@@ -270,8 +310,9 @@ def print_prop_firm(pf: dict) -> None:
           f"Days: {cfg['max_days']}")
 
     print("\n  " + "-" * 58)
-    print(f"  {'Simulations':30s} {pf['n_simulations']:>10d}")
+    print(f"  {'Simulations':30s} {pf['n_simulations']:>10,d}")
     print(f"  {'Pass Rate':30s} {pf['pass_rate']:>9.1f}%")
+    print(f"  {'95% CI':30s}  [{ci[0]:.1f}% - {ci[1]:.1f}%]")
     print(f"  {'Fail Rate':30s} {pf['fail_rate']:>9.1f}%")
     print(f"  {'Avg Days to Pass':30s} {pf['avg_days_to_pass']:>10.1f}")
 
@@ -279,11 +320,17 @@ def print_prop_firm(pf: dict) -> None:
         print("\n  Failure breakdown:")
         for reason, count in sorted(pf["fail_reasons"].items(), key=lambda x: -x[1]):
             pct = count / pf["n_simulations"] * 100
-            print(f"    {reason:26s} {count:>5d}  ({pct:.1f}%)")
+            print(f"    {reason:26s} {count:>5,d}  ({pct:.1f}%)")
 
     print("\n  " + "-" * 58)
-    print(f"  {'':30s} {'  5th':>8s} {' 50th':>8s} {' 95th':>8s}")
-    print(f"  {'Peak Drawdown %':30s} {dd['dd_p5']:>8.2f} {dd['dd_p50']:>8.2f} {dd['dd_p95']:>8.2f}")
+    header = f"  {'':30s} {'  5th':>8s} {' 25th':>8s} {' 50th':>8s} {' 75th':>8s} {' 95th':>8s}"
+    print(header)
+    print(f"  {'Peak Drawdown %':30s} "
+          f"{dd['dd_p5']:>8.2f} {dd['dd_p25']:>8.2f} {dd['dd_p50']:>8.2f} "
+          f"{dd['dd_p75']:>8.2f} {dd['dd_p95']:>8.2f}")
+    print(f"  {'Final Equity ($)':30s} "
+          f"{eq['eq_p5']:>8,.0f} {eq['eq_p25']:>8,.0f} {eq['eq_p50']:>8,.0f} "
+          f"{eq['eq_p75']:>8,.0f} {eq['eq_p95']:>8,.0f}")
 
     print("\n  " + "-" * 58)
     a_status = actual["outcome"]

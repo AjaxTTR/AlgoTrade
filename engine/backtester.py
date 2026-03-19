@@ -5,7 +5,8 @@ Simulates trade execution from a signal DataFrame produced by a strategy
 function.  Models next-bar-open fills, gap-aware stop-loss and take-profit,
 per-side commissions, slippage, and proper position sizing.
 
-Supports trailing stops, partial take-profit exits, and equity guards.
+Supports trailing stops, partial take-profit exits, equity guards, and
+multiple concurrent positions with entry spacing constraints.
 """
 
 import logging
@@ -29,11 +30,29 @@ class TradeRecord:
     pnl: float
     return_pct: float
     exit_reason: str        # "stop", "target", "partial_tp", "trailing_stop",
-                            # "session_close", "final_bar"
+                            # "session_close", "final_bar", "time_exit"
     mae: float = 0.0       # max adverse excursion (points, always >= 0)
     mfe: float = 0.0       # max favourable excursion (points, always >= 0)
     mae_mfe_ratio: float = 0.0  # MAE / MFE (lower = cleaner trade)
     stop_distance: float = 0.0  # initial stop distance in points
+
+
+@dataclass
+class _Position:
+    """Internal state for an active position."""
+    direction: int
+    size: int
+    entry_price: float
+    stop_price: float
+    tp_price: float
+    entry_idx: int
+    partial_filled: bool = False
+    trail_stop: float = float('nan')
+    original_size: int = 0
+    mae: float = 0.0
+    mfe: float = 0.0
+    stop_distance: float = 0.0
+    prev_mtm: float = 0.0
 
 
 @dataclass
@@ -46,6 +65,8 @@ class BacktestResult:
     signals_df: pd.DataFrame = field(default_factory=pd.DataFrame)
     halted: bool = False
     halt_bar_index: int = -1
+    daily_trade_counts: dict = field(default_factory=dict)
+    max_concurrent_positions: int = 0
 
 
 def run(
@@ -70,6 +91,10 @@ def run(
     vol_stop_tighten_factor: float = 0.75,
     max_bars_in_trade: int = 0,
     max_daily_risk: float = 0.0,
+    max_concurrent_trades: int = 2,
+    min_bars_between_entries: int = 2,
+    consec_loss_threshold: int = 2,
+    loss_scale_down: float = 0.5,
     **kwargs,
 ) -> BacktestResult:
     """Execute a backtest over a signal DataFrame.
@@ -86,11 +111,18 @@ def run(
     - Market order fills (entries, stops, session exits) pay slippage + half-spread.
     - Limit order fills (TP) pay half-spread only (slightly optimistic).
 
+    Multi-position constraints
+    --------------------------
+    - max_concurrent_trades: max open positions at once (default 2).
+    - min_bars_between_entries: min bars between consecutive fills (default 2).
+    - When a pending signal conflicts with an existing pending of lower
+      priority (higher signal_tier), the higher-priority signal wins.
+
     Parameters
     ----------
     signals : pd.DataFrame
         Must contain columns: open, high, low, close, signal, stop_price.
-        Optionally contains: tp_price, session_close, atr.
+        Optionally contains: tp_price, session_close, atr, signal_tier.
     initial_capital : float
         Starting account equity in USD.
     risk_per_trade : float
@@ -103,8 +135,7 @@ def run(
         Points of slippage applied adversely on market order fills.
     spread_points : float
         Bid-ask spread in points (default 0.25 for NQ). Half-spread is
-        applied adversely on every fill. Combined with slippage on market
-        orders; applied alone on limit-order TP fills.
+        applied adversely on every fill.
     use_trailing_stop : bool
         Enable partial TP at target + ATR trailing stop on remainder.
     trail_atr_multiple : float
@@ -115,41 +146,36 @@ def run(
         Move stop to breakeven after partial TP (default True).
     daily_dd_limit : float
         Max daily loss as fraction of day's starting equity (default 0.05 = 5%).
-        If daily P&L hits this limit, halt trading for the rest of that day.
-        Set to 0 to disable.
     max_dd_limit : float
         Max total drawdown from equity peak (default 0.10 = 10%).
-        If equity drops this much from peak, halt all trading permanently.
-        Set to 0 to disable.
     use_volatility_sizing : bool
         If True and ATR is available, size positions using ATR-based
-        volatility normalisation instead of stop distance. Falls back
-        to stop-distance sizing when ATR is missing or zero.
+        volatility normalisation.
     execution_delay_bars : int
-        Number of bars between signal generation and order fill
-        (default 1 = next-bar open, matching prior behaviour).
-        A new signal while one is pending replaces the earlier one.
+        Bars between signal and fill (default 1 = next-bar open).
     max_loss_per_trade : float
         Hard USD cap on any single trade loss (default 0 = disabled).
-        If unrealised loss exceeds this on any bar, force-exit at market.
-        Prevents fat-tail outliers from extreme gap/momentum events.
     vol_stop_tighten : bool
         Enable volatility-adjusted stop tightening (default False).
-        When current ATR exceeds its rolling median by vol_stop_tighten_threshold,
-        the initial stop distance is multiplied by vol_stop_tighten_factor.
     vol_stop_tighten_threshold : float
-        ATR ratio above which stops are tightened (default 1.5 = 50% above median).
+        ATR ratio above which stops are tightened (default 1.5).
     vol_stop_tighten_factor : float
-        Multiplier applied to stop distance when vol is elevated (default 0.75).
+        Multiplier for stop distance when vol is elevated (default 0.75).
     max_bars_in_trade : int
         Force-exit after this many bars in a trade (default 0 = disabled).
-        Prevents capital lock-up in stale positions.
     max_daily_risk : float
-        Max cumulative risk as fraction of day-start equity (default 0 = disabled).
-        Before each new entry, check if the day's realised losses plus the
-        new trade's worst-case stop loss would exceed this cap.  If so,
-        skip the entry.  This limits total daily exposure across multiple
-        sequential trades.
+        Max cumulative risk as fraction of day-start equity (default 0).
+    max_concurrent_trades : int
+        Maximum positions open simultaneously (default 2).
+    min_bars_between_entries : int
+        Minimum bars between consecutive entry fills (default 2).
+    consec_loss_threshold : int
+        After this many consecutive losses, scale position size down
+        (default 2).
+    loss_scale_down : float
+        Multiplier applied to risk_per_trade after consec_loss_threshold
+        consecutive losses (default 0.5 = halve size).  Resets to 1.0
+        after the next winning trade.
 
     Returns
     -------
@@ -168,6 +194,7 @@ def run(
     has_atr = "atr" in signals.columns
     atrs = signals["atr"].values if has_atr else np.full(len(closes), np.nan)
     size_factors = signals["size_factor"].values if "size_factor" in signals.columns else np.ones(len(closes), dtype=np.float64)
+    signal_tiers = signals["signal_tier"].values if "signal_tier" in signals.columns else np.zeros(len(closes), dtype=int)
 
     timestamps = signals.index
     n = len(closes)
@@ -181,83 +208,99 @@ def run(
     else:
         atr_rolling_median = None
 
-    # Precompute execution costs: market orders pay slippage + half-spread,
+    # Execution costs: market orders pay slippage + half-spread,
     # limit orders (TP) pay half-spread only.
     half_spread = spread_points / 2.0
-    market_cost = slippage_points + half_spread  # entries, stops, session exits
-    limit_cost = half_spread                     # TP fills only
+    market_cost = slippage_points + half_spread
+    limit_cost = half_spread
 
     equity_mtm = np.empty(n, dtype=np.float64)
     equity_closed = np.empty(n, dtype=np.float64)
     equity_mtm[0] = initial_capital
     equity_closed[0] = initial_capital
 
-    # Position state
-    pos_dir = 0             # 1 long, -1 short, 0 flat
-    pos_size = 0            # contracts (int)
-    entry_price = 0.0
-    stop_price = np.nan
-    tp_price = np.nan
-    entry_idx = 0
-
-    # Trailing stop / partial TP state
-    partial_filled = False
-    trail_stop = np.nan
-    original_size = 0
-
-    # MAE/MFE tracking (points from entry, always >= 0)
-    trade_mae = 0.0   # max adverse excursion
-    trade_mfe = 0.0   # max favourable excursion
-    trade_stop_dist = 0.0  # initial stop distance in points
+    # Multi-position state
+    positions: list[_Position] = []
+    last_entry_bar = -999
 
     # Pending entry: signal queued with a target fill bar
     pending_signal = 0
     pending_stop = np.nan
     pending_tp = np.nan
-    pending_fill_bar = -1  # bar index at which to fill
+    pending_fill_bar = -1
     pending_size_factor = 1.0
+    pending_tier = 999  # lower = higher priority
 
     closed_equity = initial_capital
-    prev_mtm = 0.0
 
     # Prop firm risk control state
-    halted = False              # permanent halt (max DD breached)
+    halted = False
     halt_bar_index = -1
-    daily_halted = False        # daily halt (resets each new day)
+    daily_halted = False
     equity_peak = initial_capital
     day_start_equity = initial_capital
-    day_realized_loss = 0.0     # cumulative realised loss today (positive = loss)
+    day_realized_loss = 0.0
     current_date = timestamps[0].date()
+
+    # Dynamic sizing: consecutive loss tracking
+    consec_losses = 0
+    size_scale = 1.0  # multiplied into risk_per_trade
+
+    # Tracking
+    daily_trade_counts: dict = {}
+    max_concurrent_seen = 0
 
     trades: list[TradeRecord] = []
 
-    def _record_exit(exit_bar, fill_px, size, reason):
-        """Helper to record a trade exit and update equity."""
-        nonlocal bar_cash_flow, closed_equity, prev_mtm, day_realized_loss
-        gross_pnl = pos_dir * (fill_px - entry_price) * size * point_value
+    def _clear_pending():
+        nonlocal pending_signal, pending_stop, pending_tp
+        nonlocal pending_fill_bar, pending_size_factor, pending_tier
+        pending_signal = 0
+        pending_stop = np.nan
+        pending_tp = np.nan
+        pending_fill_bar = -1
+        pending_size_factor = 1.0
+        pending_tier = 999
+
+    def _record_exit(pos, exit_bar, fill_px, size, reason):
+        """Record a trade exit and update equity."""
+        nonlocal bar_cash_flow, closed_equity, day_realized_loss
+        nonlocal consec_losses, size_scale
+        gross_pnl = pos.direction * (fill_px - pos.entry_price) * size * point_value
         exit_comm = commission_per_side * size
         net_pnl = gross_pnl - exit_comm
-        # Proportion of MTM attributable to this leg
-        mtm_share = prev_mtm * (size / pos_size) if pos_size > 0 else 0.0
+        mtm_share = pos.prev_mtm * (size / pos.size) if pos.size > 0 else 0.0
         bar_cash_flow += net_pnl + mtm_share
         closed_equity += net_pnl
         if net_pnl < 0:
             day_realized_loss += abs(net_pnl)
-        mae_mfe_ratio = trade_mae / trade_mfe if trade_mfe > 0 else 0.0
+
+        # Dynamic sizing: track consecutive losses
+        is_full_exit = (reason != "partial_tp")
+        if is_full_exit:
+            if net_pnl < 0:
+                consec_losses += 1
+                if consec_losses >= consec_loss_threshold:
+                    size_scale = loss_scale_down
+            else:
+                consec_losses = 0
+                size_scale = 1.0
+
+        mae_mfe_ratio = pos.mae / pos.mfe if pos.mfe > 0 else 0.0
         trades.append(TradeRecord(
-            entry_time=timestamps[entry_idx],
+            entry_time=timestamps[pos.entry_idx],
             exit_time=timestamps[exit_bar],
-            direction=pos_dir,
-            entry_price=entry_price,
+            direction=pos.direction,
+            entry_price=pos.entry_price,
             exit_price=fill_px,
             size=size,
             pnl=net_pnl,
             return_pct=net_pnl / equity_mtm[exit_bar - 1] * 100 if equity_mtm[exit_bar - 1] != 0 else 0.0,
             exit_reason=reason,
-            mae=trade_mae,
-            mfe=trade_mfe,
+            mae=pos.mae,
+            mfe=pos.mfe,
             mae_mfe_ratio=round(mae_mfe_ratio, 4),
-            stop_distance=trade_stop_dist,
+            stop_distance=pos.stop_distance,
         ))
         return net_pnl
 
@@ -267,13 +310,11 @@ def run(
         # ── Prop firm risk controls ──
         bar_date = timestamps[i].date()
         if bar_date != current_date:
-            # New trading day: reset daily halt, update day start equity
             current_date = bar_date
             daily_halted = False
             day_start_equity = equity_mtm[i - 1]
             day_realized_loss = 0.0
 
-        # Track equity peak
         if equity_mtm[i - 1] > equity_peak:
             equity_peak = equity_mtm[i - 1]
 
@@ -298,137 +339,127 @@ def run(
                     i, equity_mtm[i - 1], equity_peak, total_dd * 100,
                 )
 
-        # ── 1. Update MAE/MFE from this bar's extremes ──
-        if pos_dir != 0:
-            if pos_dir == 1:
-                adverse = entry_price - lows[i]    # how far price moved against long
-                favorable = highs[i] - entry_price  # how far price moved for long
+        # ── 1. Update MAE/MFE for all open positions ──
+        for pos in positions:
+            if pos.direction == 1:
+                adverse = pos.entry_price - lows[i]
+                favorable = highs[i] - pos.entry_price
             else:
-                adverse = highs[i] - entry_price   # how far price moved against short
-                favorable = entry_price - lows[i]   # how far price moved for short
-            if adverse > trade_mae:
-                trade_mae = adverse
-            if favorable > trade_mfe:
-                trade_mfe = favorable
+                adverse = highs[i] - pos.entry_price
+                favorable = pos.entry_price - lows[i]
+            if adverse > pos.mae:
+                pos.mae = adverse
+            if favorable > pos.mfe:
+                pos.mfe = favorable
 
-        # ── Check exits on open position ──
-        if pos_dir != 0:
+        # ── 2. Check exits for all open positions ──
+        to_remove = []
+        for pidx, pos in enumerate(positions):
             exited = False
             fill_price = np.nan
             exit_reason = ""
 
-            # Max loss per trade cap — hard override, checked first
+            # Max loss per trade cap
             if not exited and max_loss_per_trade > 0:
-                unrealised = pos_dir * (closes[i] - entry_price) * pos_size * point_value
+                unrealised = pos.direction * (closes[i] - pos.entry_price) * pos.size * point_value
                 if unrealised <= -max_loss_per_trade:
                     fill_price = closes[i]
-                    if pos_dir == 1:
+                    if pos.direction == 1:
                         fill_price -= market_cost
                     else:
                         fill_price += market_cost
                     exited = True
                     exit_reason = "max_loss_cap"
 
-            # Stop-loss checked FIRST (priority)
-            if not exited and pos_dir == 1 and lows[i] <= stop_price:
-                fill_price = min(stop_price, opens[i])
-                fill_price -= market_cost
+            # Stop-loss (priority)
+            if not exited and pos.direction == 1 and lows[i] <= pos.stop_price:
+                fill_price = min(pos.stop_price, opens[i]) - market_cost
                 exited = True
                 exit_reason = "stop"
-            elif not exited and pos_dir == -1 and highs[i] >= stop_price:
-                fill_price = max(stop_price, opens[i])
-                fill_price += market_cost
+            elif not exited and pos.direction == -1 and highs[i] >= pos.stop_price:
+                fill_price = max(pos.stop_price, opens[i]) + market_cost
                 exited = True
                 exit_reason = "stop"
 
-            # Trailing stop checked second (only when trailing is active)
-            if not exited and partial_filled and not np.isnan(trail_stop):
-                if pos_dir == 1:
-                    # Ratchet trail stop up
+            # Trailing stop (when partial TP has fired)
+            if not exited and pos.partial_filled and not np.isnan(pos.trail_stop):
+                if pos.direction == 1:
                     new_trail = highs[i] - atrs[i] * trail_atr_multiple
-                    if new_trail > trail_stop:
-                        trail_stop = new_trail
-                    if lows[i] <= trail_stop:
-                        fill_price = min(trail_stop, opens[i])
-                        fill_price -= market_cost
+                    if new_trail > pos.trail_stop:
+                        pos.trail_stop = new_trail
+                    if lows[i] <= pos.trail_stop:
+                        fill_price = min(pos.trail_stop, opens[i]) - market_cost
                         exited = True
                         exit_reason = "trailing_stop"
-                elif pos_dir == -1:
-                    # Ratchet trail stop down
+                elif pos.direction == -1:
                     new_trail = lows[i] + atrs[i] * trail_atr_multiple
-                    if new_trail < trail_stop:
-                        trail_stop = new_trail
-                    if highs[i] >= trail_stop:
-                        fill_price = max(trail_stop, opens[i])
-                        fill_price += market_cost
+                    if new_trail < pos.trail_stop:
+                        pos.trail_stop = new_trail
+                    if highs[i] >= pos.trail_stop:
+                        fill_price = max(pos.trail_stop, opens[i]) + market_cost
                         exited = True
                         exit_reason = "trailing_stop"
 
             # Take-profit / partial TP
-            if not exited and not np.isnan(tp_price):
-                if pos_dir == 1 and highs[i] >= tp_price:
-                    fill_price = max(tp_price, opens[i]) - limit_cost
+            if not exited and not np.isnan(pos.tp_price):
+                if pos.direction == 1 and highs[i] >= pos.tp_price:
+                    fill_price = max(pos.tp_price, opens[i]) - limit_cost
 
-                    if use_trailing_stop and not partial_filled and pos_size > 1:
-                        # Partial exit: close partial_tp_pct of position
-                        partial_size = math.floor(pos_size * partial_tp_pct)
+                    if use_trailing_stop and not pos.partial_filled and pos.size > 1:
+                        partial_size = math.floor(pos.size * partial_tp_pct)
                         if partial_size < 1:
                             partial_size = 1
-                        _record_exit(i, fill_price, partial_size, "partial_tp")
-                        # Reduce position, keep remainder
-                        remaining = pos_size - partial_size
-                        # Update MTM for reduced position
-                        prev_mtm = pos_dir * (closes[i] - entry_price) * remaining * point_value
-                        pos_size = remaining
-                        partial_filled = True
-                        # Move stop to breakeven
+                        _record_exit(pos, i, fill_price, partial_size, "partial_tp")
+                        remaining = pos.size - partial_size
+                        pos.prev_mtm = pos.direction * (closes[i] - pos.entry_price) * remaining * point_value
+                        pos.size = remaining
+                        pos.partial_filled = True
                         if move_stop_to_be:
-                            stop_price = entry_price
-                        # Initialize trailing stop
+                            pos.stop_price = pos.entry_price
                         if has_atr and not np.isnan(atrs[i]):
-                            trail_stop = highs[i] - atrs[i] * trail_atr_multiple
-                        tp_price = np.nan  # disable further TP checks
+                            pos.trail_stop = highs[i] - atrs[i] * trail_atr_multiple
+                        pos.tp_price = np.nan
                     else:
                         exited = True
                         exit_reason = "target"
 
-                elif pos_dir == -1 and lows[i] <= tp_price:
-                    fill_price = min(tp_price, opens[i]) + limit_cost
+                elif pos.direction == -1 and lows[i] <= pos.tp_price:
+                    fill_price = min(pos.tp_price, opens[i]) + limit_cost
 
-                    if use_trailing_stop and not partial_filled and pos_size > 1:
-                        partial_size = math.floor(pos_size * partial_tp_pct)
+                    if use_trailing_stop and not pos.partial_filled and pos.size > 1:
+                        partial_size = math.floor(pos.size * partial_tp_pct)
                         if partial_size < 1:
                             partial_size = 1
-                        _record_exit(i, fill_price, partial_size, "partial_tp")
-                        remaining = pos_size - partial_size
-                        prev_mtm = pos_dir * (closes[i] - entry_price) * remaining * point_value
-                        pos_size = remaining
-                        partial_filled = True
+                        _record_exit(pos, i, fill_price, partial_size, "partial_tp")
+                        remaining = pos.size - partial_size
+                        pos.prev_mtm = pos.direction * (closes[i] - pos.entry_price) * remaining * point_value
+                        pos.size = remaining
+                        pos.partial_filled = True
                         if move_stop_to_be:
-                            stop_price = entry_price
+                            pos.stop_price = pos.entry_price
                         if has_atr and not np.isnan(atrs[i]):
-                            trail_stop = lows[i] + atrs[i] * trail_atr_multiple
-                        tp_price = np.nan
+                            pos.trail_stop = lows[i] + atrs[i] * trail_atr_multiple
+                        pos.tp_price = np.nan
                     else:
                         exited = True
                         exit_reason = "target"
 
-            # Time-based exit — force close after max bars
+            # Time-based exit (holding period)
             if not exited and max_bars_in_trade > 0:
-                bars_held = i - entry_idx
+                bars_held = i - pos.entry_idx
                 if bars_held >= max_bars_in_trade:
                     fill_price = closes[i]
-                    if pos_dir == 1:
+                    if pos.direction == 1:
                         fill_price -= market_cost
                     else:
                         fill_price += market_cost
                     exited = True
                     exit_reason = "time_exit"
 
-            # Session close exit — checked last
+            # Session close exit
             if not exited and session_closes[i]:
                 fill_price = closes[i]
-                if pos_dir == 1:
+                if pos.direction == 1:
                     fill_price -= market_cost
                 else:
                     fill_price += market_cost
@@ -436,169 +467,170 @@ def run(
                 exit_reason = "session_close"
 
             if exited:
-                _record_exit(i, fill_price, pos_size, exit_reason)
-                # Reset all position state
-                prev_mtm = 0.0
-                pos_dir = 0
-                pos_size = 0
-                partial_filled = False
-                trail_stop = np.nan
-                original_size = 0
-                trade_mae = 0.0
-                trade_mfe = 0.0
-                trade_stop_dist = 0.0
+                _record_exit(pos, i, fill_price, pos.size, exit_reason)
+                to_remove.append(pidx)
 
-        # ── 2. Fill pending entry ──
-        if pos_dir == 0 and pending_signal != 0 and i >= pending_fill_bar and not halted and not daily_halted:
-            sig = pending_signal
-            stop_val = pending_stop
-            tp_val = pending_tp
-            sfactor = pending_size_factor
+        # Remove exited positions (reverse to preserve indices)
+        for pidx in reversed(to_remove):
+            positions.pop(pidx)
 
-            fill_price = opens[i] + market_cost if sig == 1 else opens[i] - market_cost
+        # ── 3. Fill pending entry ──
+        if (pending_signal != 0 and i >= pending_fill_bar
+                and not halted and not daily_halted):
 
-            # Max daily risk gate: skip entry if adding this trade's
-            # worst-case loss would push total daily risk past the cap.
-            if max_daily_risk > 0 and day_start_equity > 0:
-                trade_worst_case = equity_mtm[i - 1] * risk_per_trade * sfactor
-                total_if_loss = day_realized_loss + trade_worst_case
-                daily_risk_cap = day_start_equity * max_daily_risk
-                if total_if_loss > daily_risk_cap:
-                    log.debug(
-                        "Bar %d: daily risk gate — realized=$%.0f + new=$%.0f "
-                        "> cap=$%.0f, skipping entry",
-                        i, day_realized_loss, trade_worst_case, daily_risk_cap,
-                    )
-                    pending_signal = 0
-                    pending_stop = np.nan
-                    pending_tp = np.nan
-                    pending_fill_bar = -1
-                    pending_size_factor = 1.0
-                    # Skip to MTM update
-                    current_mtm = 0.0
-                    equity_mtm[i] = equity_mtm[i - 1] + bar_cash_flow
-                    equity_closed[i] = closed_equity
-                    continue
+            # Concurrent capacity check
+            if len(positions) >= max_concurrent_trades:
+                _clear_pending()
 
-            risk_amount = equity_mtm[i - 1] * risk_per_trade * sfactor
-            contracts = 0
-            sizing_method = ""
+            # Entry spacing check
+            elif i - last_entry_bar < min_bars_between_entries:
+                _clear_pending()
 
-            # Volatility-normalised sizing: ATR * point_value per contract
-            if use_volatility_sizing and has_atr and not np.isnan(atrs[i]) and atrs[i] > 0:
-                risk_per_contract = atrs[i] * point_value
-                contracts = math.floor(risk_amount / risk_per_contract)
-                sizing_method = "volatility"
             else:
-                # Fallback: stop-distance sizing
-                stop_dist = abs(fill_price - stop_val)
-                if stop_dist > 0:
-                    contracts = math.floor(risk_amount / (stop_dist * point_value))
-                    sizing_method = "stop_distance"
+                sig = pending_signal
+                stop_val = pending_stop
+                tp_val = pending_tp
+                sfactor = pending_size_factor
 
-            if contracts >= 1:
-                if sizing_method == "volatility":
-                    log.debug(
-                        "Bar %d: vol sizing — ATR=%.2f, risk=$%.0f, contracts=%d",
-                        i, atrs[i], risk_amount, contracts,
-                    )
-                else:
-                    log.debug(
-                        "Bar %d: stop-dist sizing — dist=%.2f, risk=$%.0f, contracts=%d",
-                        i, abs(fill_price - stop_val), risk_amount, contracts,
-                    )
+                fill_price = opens[i] + market_cost if sig == 1 else opens[i] - market_cost
 
-                entry_commission = commission_per_side * contracts
-                bar_cash_flow -= entry_commission
-
-                entry_price = fill_price
-
-                # Volatility-adjusted stop tightening
-                if (vol_stop_tighten and atr_rolling_median is not None
-                        and not np.isnan(atrs[i]) and atrs[i] > 0
-                        and not np.isnan(atr_rolling_median[i])
-                        and atr_rolling_median[i] > 0):
-                    atr_ratio = atrs[i] / atr_rolling_median[i]
-                    if atr_ratio >= vol_stop_tighten_threshold:
-                        orig_dist = abs(fill_price - stop_val)
-                        tight_dist = orig_dist * vol_stop_tighten_factor
-                        if sig == 1:
-                            stop_val = fill_price - tight_dist
-                        else:
-                            stop_val = fill_price + tight_dist
+                # Max daily risk gate
+                skip_entry = False
+                if max_daily_risk > 0 and day_start_equity > 0:
+                    trade_worst_case = equity_mtm[i - 1] * risk_per_trade * sfactor
+                    total_if_loss = day_realized_loss + trade_worst_case
+                    daily_risk_cap = day_start_equity * max_daily_risk
+                    if total_if_loss > daily_risk_cap:
                         log.debug(
-                            "Bar %d: vol stop tighten — ATR ratio=%.2f, "
-                            "stop dist %.2f -> %.2f",
-                            i, atr_ratio, orig_dist, tight_dist,
+                            "Bar %d: daily risk gate — realized=$%.0f + new=$%.0f "
+                            "> cap=$%.0f, skipping entry",
+                            i, day_realized_loss, trade_worst_case, daily_risk_cap,
                         )
+                        skip_entry = True
 
-                stop_price = stop_val
-                tp_price = tp_val
-                pos_dir = sig
-                pos_size = contracts
-                original_size = contracts
-                entry_idx = i
-                partial_filled = False
-                trail_stop = np.nan
-                trade_mae = 0.0
-                trade_mfe = 0.0
-                trade_stop_dist = abs(fill_price - stop_val)
+                if not skip_entry:
+                    risk_amount = equity_mtm[i - 1] * risk_per_trade * sfactor * size_scale
+                    contracts = 0
 
-            pending_signal = 0
-            pending_stop = np.nan
-            pending_tp = np.nan
-            pending_fill_bar = -1
-            pending_size_factor = 1.0
+                    # Volatility-normalised sizing
+                    if use_volatility_sizing and has_atr and not np.isnan(atrs[i]) and atrs[i] > 0:
+                        risk_per_contract = atrs[i] * point_value
+                        contracts = math.floor(risk_amount / risk_per_contract)
+                    else:
+                        # Fallback: stop-distance sizing
+                        stop_dist = abs(fill_price - stop_val)
+                        if stop_dist > 0:
+                            contracts = math.floor(risk_amount / (stop_dist * point_value))
 
-        # ── 3. Register new signal ──
-        if pos_dir == 0 and sigs[i] != 0 and not np.isnan(stops[i]) and not halted and not daily_halted:
-            fill_bar = i + execution_delay_bars
-            if fill_bar < n:  # enough bars remaining to fill
-                pending_signal = sigs[i]
-                pending_stop = stops[i]
-                pending_tp = tps[i]
-                pending_fill_bar = fill_bar
-                pending_size_factor = size_factors[i]
+                    if contracts >= 1:
+                        entry_commission = commission_per_side * contracts
+                        bar_cash_flow -= entry_commission
 
-        # ── 4. Mark-to-market ──
-        current_mtm = 0.0
-        if pos_dir != 0:
-            current_mtm = pos_dir * (closes[i] - entry_price) * pos_size * point_value
+                        entry_px = fill_price
 
-        equity_mtm[i] = equity_mtm[i - 1] + bar_cash_flow + (current_mtm - prev_mtm)
+                        # Volatility-adjusted stop tightening
+                        if (vol_stop_tighten and atr_rolling_median is not None
+                                and not np.isnan(atrs[i]) and atrs[i] > 0
+                                and not np.isnan(atr_rolling_median[i])
+                                and atr_rolling_median[i] > 0):
+                            atr_ratio = atrs[i] / atr_rolling_median[i]
+                            if atr_ratio >= vol_stop_tighten_threshold:
+                                orig_dist = abs(fill_price - stop_val)
+                                tight_dist = orig_dist * vol_stop_tighten_factor
+                                if sig == 1:
+                                    stop_val = fill_price - tight_dist
+                                else:
+                                    stop_val = fill_price + tight_dist
+
+                        pos = _Position(
+                            direction=sig,
+                            size=contracts,
+                            entry_price=entry_px,
+                            stop_price=stop_val,
+                            tp_price=tp_val,
+                            entry_idx=i,
+                            original_size=contracts,
+                            stop_distance=abs(entry_px - stop_val),
+                        )
+                        positions.append(pos)
+                        last_entry_bar = i
+                        daily_trade_counts[bar_date] = daily_trade_counts.get(bar_date, 0) + 1
+
+                _clear_pending()
+
+        # ── 4. Register new signal (tier priority) ──
+        if (sigs[i] != 0 and not np.isnan(stops[i])
+                and not halted and not daily_halted):
+            effective_count = len(positions) + (1 if pending_signal != 0 else 0)
+            if effective_count < max_concurrent_trades:
+                fill_bar = i + execution_delay_bars
+                if fill_bar < n:
+                    new_tier = int(signal_tiers[i]) if signal_tiers[i] > 0 else 999
+                    if pending_signal != 0:
+                        # Replace only if new signal has higher priority (lower tier)
+                        if new_tier < pending_tier:
+                            pending_signal = sigs[i]
+                            pending_stop = stops[i]
+                            pending_tp = tps[i]
+                            pending_fill_bar = fill_bar
+                            pending_size_factor = size_factors[i]
+                            pending_tier = new_tier
+                    else:
+                        pending_signal = sigs[i]
+                        pending_stop = stops[i]
+                        pending_tp = tps[i]
+                        pending_fill_bar = fill_bar
+                        pending_size_factor = size_factors[i]
+                        pending_tier = new_tier
+
+        # ── 5. Mark-to-market ──
+        current_total_mtm = 0.0
+        prev_total_mtm = 0.0
+        for pos in positions:
+            current_total_mtm += pos.direction * (closes[i] - pos.entry_price) * pos.size * point_value
+            prev_total_mtm += pos.prev_mtm
+
+        equity_mtm[i] = equity_mtm[i - 1] + bar_cash_flow + (current_total_mtm - prev_total_mtm)
         equity_closed[i] = closed_equity
-        prev_mtm = current_mtm
 
-    # ── Close any remaining position at last bar's close ──
-    if pos_dir != 0:
+        # Update per-position prev_mtm
+        for pos in positions:
+            pos.prev_mtm = pos.direction * (closes[i] - pos.entry_price) * pos.size * point_value
+
+        # Track peak concurrent positions
+        if len(positions) > max_concurrent_seen:
+            max_concurrent_seen = len(positions)
+
+    # ── Close any remaining positions at last bar's close ──
+    for pos in positions:
         exit_price = closes[-1]
-        if pos_dir == 1:
+        if pos.direction == 1:
             exit_price -= market_cost
         else:
             exit_price += market_cost
 
-        gross_pnl = pos_dir * (exit_price - entry_price) * pos_size * point_value
-        exit_commission = commission_per_side * pos_size
-        net_pnl = gross_pnl - exit_commission
+        gross_pnl = pos.direction * (exit_price - pos.entry_price) * pos.size * point_value
+        exit_comm = commission_per_side * pos.size
+        net_pnl = gross_pnl - exit_comm
         closed_equity += net_pnl
 
-        mae_mfe_ratio = trade_mae / trade_mfe if trade_mfe > 0 else 0.0
+        mae_mfe_ratio = pos.mae / pos.mfe if pos.mfe > 0 else 0.0
         trades.append(TradeRecord(
-            entry_time=timestamps[entry_idx],
+            entry_time=timestamps[pos.entry_idx],
             exit_time=timestamps[-1],
-            direction=pos_dir,
-            entry_price=entry_price,
+            direction=pos.direction,
+            entry_price=pos.entry_price,
             exit_price=exit_price,
-            size=pos_size,
+            size=pos.size,
             pnl=net_pnl,
             return_pct=net_pnl / equity_mtm[-2] * 100 if equity_mtm[-2] != 0 else 0.0,
             exit_reason="final_bar",
-            mae=trade_mae,
-            mfe=trade_mfe,
+            mae=pos.mae,
+            mfe=pos.mfe,
             mae_mfe_ratio=round(mae_mfe_ratio, 4),
-            stop_distance=trade_stop_dist,
+            stop_distance=pos.stop_distance,
         ))
-        equity_closed[-1] = closed_equity
+    equity_closed[-1] = closed_equity
 
     # ── Build output series ──
     mtm_series = pd.Series(equity_mtm, index=timestamps, name="equity_mtm")
@@ -616,4 +648,6 @@ def run(
         signals_df=signals,
         halted=halted,
         halt_bar_index=halt_bar_index,
+        daily_trade_counts=daily_trade_counts,
+        max_concurrent_positions=max_concurrent_seen,
     )

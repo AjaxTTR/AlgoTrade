@@ -15,7 +15,10 @@ Trade logic:
   3. Standard entry: otherwise, enter at 10:30 after full first hour.
   4. Pullback re-entries: after each trade exits (holding period),
      re-enter long on pullback-and-recovery bars.
-  5. Max trades per day caps total entries.
+  5. Midday continuation: after 11:00, enter on consolidation breakout
+     or higher-high after pullback, if aligned with first-hour bias.
+     Max 1 additional trade per day.
+  6. Max trades per day caps total entries.
 
 Every strategy module in /strategies must expose:
 
@@ -43,11 +46,17 @@ def generate_signals(
     tp_atr_multiple: float = 2.0,
     holding_bars: int = 8,
     max_trades_per_day: int = 3,
-    pullback_atr_frac: float = 0.5,
+    pullback_atr_frac: float = 1.0,
     enable_early_entry: bool = True,
+    midday_start: str = "11:00",
+    midday_consol_bars: int = 4,
+    midday_consol_atr_frac: float = 1.0,
+    midday_pullback_atr_frac: float = 0.5,
+    max_midday_trades: int = 1,
+    min_bars_between_entries: int = 2,
     **kwargs,
 ) -> pd.DataFrame:
-    """First-Hour Momentum with early entry and pullback re-entries.
+    """First-Hour Momentum with early entry, pullback re-entries, and midday continuation.
 
     Parameters
     ----------
@@ -80,13 +89,29 @@ def generate_signals(
     enable_early_entry : bool
         If True, check 30-min return for early entry at early_end
         (default True).  If False, always wait for fh_end.
+    midday_start : str
+        Earliest time for midday continuation entries (default "11:00").
+    midday_consol_bars : int
+        Number of prior bars to check for consolidation (default 4).
+    midday_consol_atr_frac : float
+        Max range of consolidation window as ATR fraction (default 1.0).
+        If the high-low range of the prior N bars is below this * ATR,
+        the market is consolidating.
+    midday_pullback_atr_frac : float
+        Min pullback from session high for higher-high trigger (default 0.5).
+    max_midday_trades : int
+        Max midday continuation entries per day (default 1).
+    min_bars_between_entries : int
+        Minimum bars between consecutive signal placements (default 2).
+        Controls signal spacing so the backtester can overlap positions.
 
     Returns
     -------
     pd.DataFrame
         Copy of input with added columns: signal, stop_price, tp_price,
         session_close, atr, fh_return, size_factor, signal_tier.
-        signal_tier: 1 = early entry, 2 = standard entry, 3 = pullback.
+        signal_tier: 1 = early entry, 2 = standard entry, 3 = pullback,
+                     4 = midday continuation.
     """
     out = df.copy()
     n = len(out)
@@ -113,6 +138,7 @@ def generate_signals(
     t_fh_end = pd.Timestamp(fh_end).time()
     t_session_end = pd.Timestamp(session_end).time()
     t_entry_cutoff = pd.Timestamp(entry_cutoff).time()
+    t_midday_start = pd.Timestamp(midday_start).time()
 
     out["date"] = out.index.date
 
@@ -188,6 +214,32 @@ def generate_signals(
     out["session_high"] = session_high
 
     # ------------------------------------------------------------------
+    # Track whether a pullback from session high has occurred (per bar)
+    # A pullback means price dipped >= midday_pullback_atr_frac * ATR
+    # from the running session high at some point during the day.
+    # ------------------------------------------------------------------
+    atr_vals = out["atr"].values
+    low_vals = out["low"].values
+    had_pullback = np.zeros(n, dtype=bool)
+    pullback_active = False
+    current_date_pb = None
+    for i in range(n):
+        d = out["date"].iloc[i]
+        t = time[i]
+        if d != current_date_pb:
+            current_date_pb = d
+            pullback_active = False
+        if t >= t_session_start and t < t_session_end:
+            sh = session_high[i]
+            atr_val = atr_vals[i]
+            if not np.isnan(sh) and not np.isnan(atr_val) and atr_val > 0:
+                dip = sh - low_vals[i]
+                if dip >= midday_pullback_atr_frac * atr_val:
+                    pullback_active = True
+        had_pullback[i] = pullback_active
+    out["had_pullback"] = had_pullback
+
+    # ------------------------------------------------------------------
     # Identify bias days and early-eligible days
     #
     # bias_days: fh_return (full 60 min) > threshold
@@ -231,12 +283,14 @@ def generate_signals(
     tier_col = out.columns.get_loc("signal_tier")
     sc_col = out.columns.get_loc("session_close")
 
+    opens = out["open"].values
     closes = out["close"].values
     highs = out["high"].values
     lows = out["low"].values
     atrs = out["atr"].values
     dates = out["date"].values
     sess_highs = out["session_high"].values
+    had_pb = out["had_pullback"].values
 
     def _place_signal(idx, tier):
         """Place a long signal at bar idx, return True if successful."""
@@ -249,10 +303,6 @@ def generate_signals(
         out.iloc[idx, tp_col] = entry_px + (atr_val * tp_atr_multiple)
         out.iloc[idx, sf_col] = 1.0
         out.iloc[idx, tier_col] = tier
-        if holding_bars > 0:
-            exit_idx = idx + 1 + holding_bars
-            if exit_idx < n:
-                out.iloc[exit_idx, sc_col] = True
         return True
 
     # Group bars by date
@@ -278,6 +328,7 @@ def generate_signals(
         d_start, d_end = date_bar_ranges[d]
         trades_today = 0
         initial_signal_idx = None
+        initial_tier = None
 
         # --- Try early entry (10:00) ---
         if d in early_days:
@@ -286,6 +337,7 @@ def generate_signals(
                 if t >= t_early_end and t < t_entry_cutoff and t >= t_session_start and t < t_session_end:
                     if _place_signal(i, tier=1):
                         initial_signal_idx = i
+                        initial_tier = 1
                         trades_today = 1
                     break
 
@@ -296,41 +348,99 @@ def generate_signals(
                 if t >= t_fh_end and t < t_entry_cutoff and t >= t_session_start and t < t_session_end:
                     if _place_signal(i, tier=2):
                         initial_signal_idx = i
+                        initial_tier = 2
                         trades_today = 1
                     break
 
         if initial_signal_idx is None:
             continue
 
-        # --- Pullback re-entries ---
-        next_eligible = initial_signal_idx + 1 + holding_bars
+        next_eligible = initial_signal_idx + min_bars_between_entries
 
-        while trades_today < max_trades_per_day:
-            found = False
+        # --- Pullback re-entry (tier 3): only after confirmed Tier 2 ---
+        #
+        # Two-stage trigger to avoid shallow / choppy re-entries:
+        #   Stage 1 (pullback confirmation): bar dips >= 1 ATR from session
+        #            high AND closes in top 25% of its range (rejection).
+        #   Stage 2 (entry): a subsequent strong bullish bar — close > open,
+        #            close in top 25% of range, range > 0.25 ATR (anti-chop).
+        # Max 1 pullback trade per day.
+        if initial_tier == 2 and trades_today < max_trades_per_day:
+            pullback_confirmed = False
+
             for i in range(max(next_eligible, d_start), d_end):
                 t = time[i]
                 if t >= t_entry_cutoff or t >= t_session_end:
                     break
 
                 atr_val = atrs[i]
+                if pd.isna(atr_val) or atr_val <= 0:
+                    continue
+
                 sh = sess_highs[i]
-                if pd.isna(atr_val) or atr_val <= 0 or pd.isna(sh):
+                if pd.isna(sh):
                     continue
 
-                pullback_depth = sh - lows[i]
-                min_pullback = pullback_atr_frac * atr_val
-                if pullback_depth < min_pullback:
-                    continue
+                # Stage 1: detect pullback with rejection
+                if not pullback_confirmed:
+                    pullback_depth = sh - lows[i]
+                    if pullback_depth >= pullback_atr_frac * atr_val:
+                        bar_range = highs[i] - lows[i]
+                        if bar_range > 0 and closes[i] >= lows[i] + 0.75 * bar_range:
+                            pullback_confirmed = True
+                    continue  # never enter on the pullback bar itself
 
+                # Stage 2: strong bullish bar after confirmed pullback
                 bar_range = highs[i] - lows[i]
-                if bar_range <= 0:
-                    continue
-                if closes[i] < (highs[i] + lows[i]) / 2.0:
-                    continue
+                if bar_range <= 0 or bar_range < 0.25 * atr_val:
+                    continue  # reject narrow / choppy bars
+                if closes[i] <= opens[i]:
+                    continue  # must be bullish (close > open)
+                if closes[i] < lows[i] + 0.75 * bar_range:
+                    continue  # close must be in top 25% of bar range
 
                 if _place_signal(i, tier=3):
                     trades_today += 1
-                    next_eligible = i + 1 + holding_bars
+                    next_eligible = i + min_bars_between_entries
+                    break  # max 1 pullback per day
+
+        # --- Midday continuation (tier 4) ---
+        midday_trades = 0
+        while trades_today < max_trades_per_day and midday_trades < max_midday_trades:
+            found = False
+            for i in range(max(next_eligible, d_start), d_end):
+                t = time[i]
+                if t >= t_entry_cutoff or t >= t_session_end:
+                    break
+                if t < t_midday_start:
+                    continue
+
+                atr_val = atrs[i]
+                if pd.isna(atr_val) or atr_val <= 0:
+                    continue
+
+                midday_triggered = False
+
+                # (A) Consolidation breakout
+                if i >= midday_consol_bars:
+                    consol_high = np.max(highs[i - midday_consol_bars:i])
+                    consol_low = np.min(lows[i - midday_consol_bars:i])
+                    consol_range = consol_high - consol_low
+                    if consol_range < midday_consol_atr_frac * atr_val:
+                        if closes[i] > consol_high:
+                            midday_triggered = True
+
+                # (B) Higher high after pullback
+                if not midday_triggered and had_pb[i]:
+                    if i >= 1 and highs[i] > highs[i - 1]:
+                        bar_range = highs[i] - lows[i]
+                        if bar_range > 0 and closes[i] >= (highs[i] + lows[i]) / 2.0:
+                            midday_triggered = True
+
+                if midday_triggered and _place_signal(i, tier=4):
+                    midday_trades += 1
+                    trades_today += 1
+                    next_eligible = i + min_bars_between_entries
                     found = True
                     break
 
@@ -339,6 +449,7 @@ def generate_signals(
 
     # Clean up working columns
     out.drop(columns=["date", "fh_pctile_thresh", "fh_eff_thresh",
-                       "session_high", "early_return"], inplace=True)
+                       "session_high", "early_return", "had_pullback"],
+             inplace=True)
 
     return out
