@@ -56,16 +56,19 @@ STRATEGY_CONFIG = {
     "tp_atr_multiple": 2.0,
     "holding_bars": 8,
     "max_trades_per_day": 4,
-    "pullback_atr_frac": 0.5,
+    "pullback_atr_frac": 1.0,
     "min_bars_between_entries": 2,
+    "enable_short": True,
 }
 
 TRAIN_FRAC = 0.70
 TIER_NAMES = {
-    1: "Early Entry (10:00)",
-    2: "Standard Entry (10:30)",
-    3: "Pullback Re-entry",
-    4: "Midday Continuation",
+    1: "Long Early Entry (10:00)",
+    2: "Long Standard Entry (10:30)",
+    3: "Long Pullback Re-entry",
+    4: "Long Midday Continuation",
+    5: "Short Standard Entry (10:30)",
+    6: "Short Pullback Re-entry",
 }
 
 # ---------------------------------------------------------------------------

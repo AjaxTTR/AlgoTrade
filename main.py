@@ -66,8 +66,9 @@ STRATEGY_CONFIG = {
     "tp_atr_multiple": 2.0,
     "holding_bars": 8,              # 2 hours on 15-min bars
     "max_trades_per_day": 4,        # initial + pullback re-entries + midday continuation
-    "pullback_atr_frac": 1.0,       # min pullback depth: 1 ATR from session high
+    "pullback_atr_frac": 1.0,       # min pullback depth: 1 ATR from session high/low
     "min_bars_between_entries": 2,  # signal spacing for overlapping entries
+    "enable_short": True,           # symmetric short-side entries (Tier 5/6)
 }
 
 PROP_FIRM_CONFIGS = {

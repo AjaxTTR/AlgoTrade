@@ -60,6 +60,7 @@ BASE_STRATEGY_CONFIG = {
     "holding_bars": 8,
     "pullback_atr_frac": 1.0,
     "min_bars_between_entries": 2,
+    "enable_short": True,
 }
 
 PARAM_GRID = {
