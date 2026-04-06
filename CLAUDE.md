@@ -25,6 +25,7 @@ research/
   edge_to_strategy.py               # Edge-to-strategy conversion utilities
   threshold_comparison.py            # Pullback re-entry and tier comparison runner
   optimizer.py                       # Parallel grid search over parameter space
+  prop_firm_optimizer.py             # Prop firm pass-rate optimizer (risk/TP/SL grid search)
   tier_validation.py                 # Train/test tier-by-tier robustness validation
   walk_forward.py                    # Walk-forward analysis for overfitting detection
 data/
@@ -46,6 +47,9 @@ python -m research.walk_forward
 
 # Tier-by-tier robustness validation (train/test split)
 python -m research.tier_validation
+
+# Prop firm pass-rate optimizer (risk/TP/SL/frequency grid search)
+python -m research.prop_firm_optimizer
 ```
 
 Requires `data/nq_15m_data.csv` with columns: `timestamp, open, high, low, close, volume`
@@ -93,6 +97,17 @@ Requires `data/nq_15m_data.csv` with columns: `timestamp, open, high, low, close
 - Strategy modules expose `generate_signals(df, **params) -> DataFrame`
 - Backtester config and strategy config are separate dicts in main.py
 - Research tools (optimizer, walk_forward) share synced config with main.py
+
+## End-of-Session Protocol
+
+Before the session ends, **always** overwrite `memory/session-state.md` with a fresh snapshot of:
+- Current strategy config (exact parameters)
+- Latest backtest results (key numbers)
+- What's been tested and rejected (with reasons)
+- Current focus and next steps
+- Hard constraints
+
+This is the primary way context is preserved between sessions. Do not skip this.
 
 ## Git Workflow
 

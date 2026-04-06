@@ -1,0 +1,75 @@
+{
+    "name": "baseline_v3_gap_fh_75_dz_eod",
+    "version": "v3",
+    "description": "Locked baseline: Gap-Up + FH >= 75th pct, dead zone 0.50-0.75%, 2R TP, 1% risk, 1x ATR stop",
+    "locked": true,
+
+    "strategy_module": "strategies.gap_fh_regime_filtered",
+
+    "signal": {
+        "condition": "gap_up_fh_continuation",
+        "gap_threshold_pct": 0.10,
+        "fh_percentile": 75.0,
+        "direction": "long_only",
+        "max_trades_per_day": 1
+    },
+
+    "filters": {
+        "fh_dead_zone_lo": 0.50,
+        "fh_dead_zone_hi": 0.75,
+        "trend_20d_max": 999.0,
+        "vol_filter": false
+    },
+
+    "exits": {
+        "exit_method": "EOD",
+        "stop_atr_multiple": 1.0,
+        "tp_atr_multiple": 2.0,
+        "trailing_stop": false,
+        "max_hold_bars": 0
+    },
+
+    "strategy_params": {
+        "session_start": "09:30",
+        "session_end": "16:00",
+        "fh_end": "10:30",
+        "entry_cutoff": "15:45",
+        "atr_period": 14,
+        "stop_atr_multiple": 1.0,
+        "tp_atr_multiple": 2.0,
+        "fh_percentile": 75.0,
+        "gap_threshold_pct": 0.10,
+        "fh_dead_zone_lo": 0.50,
+        "fh_dead_zone_hi": 0.75,
+        "trend_20d_max": 999.0,
+        "vol_filter": false
+    },
+
+    "backtest": {
+        "initial_capital": 100000.0,
+        "risk_per_trade": 0.01,
+        "point_value": 20.0,
+        "commission_per_side": 2.0,
+        "slippage_points": 0.25,
+        "use_trailing_stop": false,
+        "daily_dd_limit": 0.0,
+        "max_daily_risk": 0.0,
+        "max_dd_limit": 0.0,
+        "max_bars_in_trade": 0,
+        "max_concurrent_trades": 1,
+        "min_bars_between_entries": 0,
+        "consec_loss_threshold": 0,
+        "loss_scale_down": 1.0,
+        "max_risk_per_trade": 0.0
+    },
+
+    "prop_firm": {
+        "starting_balance": 100000.0,
+        "profit_target": 0.10,
+        "daily_drawdown_limit": 0.05,
+        "max_drawdown_limit": 0.10,
+        "max_days": 0,
+        "n_simulations": 5000,
+        "phase2_profit_target": 0.05
+    }
+}

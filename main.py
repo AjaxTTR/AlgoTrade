@@ -53,6 +53,7 @@ BACKTEST_CONFIG = {
     "min_bars_between_entries": 2,  # min bars between consecutive fills
     "consec_loss_threshold": 2,     # scale down after 2 consecutive losses
     "loss_scale_down": 0.5,         # halve size during drawdown
+    "max_risk_per_trade": 0.006,    # 0.6% hard cap — skip if 1-contract exceeds this
 }
 
 STRATEGY_CONFIG = {
@@ -60,15 +61,11 @@ STRATEGY_CONFIG = {
     "session_end": "16:00",
     "fh_end": "10:30",
     "entry_cutoff": "15:45",
-    "fh_percentile": 80.0,          # top 20% first-hour moves
     "atr_period": 14,
     "stop_atr_multiple": 1.5,
     "tp_atr_multiple": 2.0,
-    "holding_bars": 8,              # 2 hours on 15-min bars
-    "max_trades_per_day": 4,        # initial + pullback re-entries + midday continuation
-    "pullback_atr_frac": 1.0,       # min pullback depth: 1 ATR from session high/low
-    "min_bars_between_entries": 2,  # signal spacing for overlapping entries
-    "enable_short": True,           # symmetric short-side entries (Tier 5/6)
+    "fh_percentile": 80.0,
+    "atr_percentile_min": 60.0,
 }
 
 PROP_FIRM_CONFIGS = {
@@ -142,6 +139,7 @@ def _export_results(result, metrics: dict, output_dir: Path) -> None:
     metrics_path = output_dir / "performance_metrics.json"
     metrics_path.write_text(json.dumps(metrics, indent=2, default=str))
     log.info("Metrics saved to %s", metrics_path)
+
 
 
 # ---------------------------------------------------------------------------
@@ -248,6 +246,7 @@ def main() -> None:
     print(f"    Bars processed:      {n_bars:>10,}")
     print(f"    Signals generated:   {n_signals:>10,}")
     print(f"    Trades completed:    {n_trades:>10,}")
+    print(f"    Risk-skipped:        {result.risk_skipped_count:>10,}")
     print(f"    Max concurrent:      {result.max_concurrent_positions:>10d}")
     if result.daily_trade_counts:
         avg_daily = sum(result.daily_trade_counts.values()) / len(result.daily_trade_counts)

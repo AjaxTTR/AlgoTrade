@@ -67,6 +67,7 @@ class BacktestResult:
     halt_bar_index: int = -1
     daily_trade_counts: dict = field(default_factory=dict)
     max_concurrent_positions: int = 0
+    risk_skipped_count: int = 0
 
 
 def run(
@@ -95,6 +96,7 @@ def run(
     min_bars_between_entries: int = 2,
     consec_loss_threshold: int = 2,
     loss_scale_down: float = 0.5,
+    max_risk_per_trade: float = 0.006,
     **kwargs,
 ) -> BacktestResult:
     """Execute a backtest over a signal DataFrame.
@@ -249,6 +251,7 @@ def run(
     # Tracking
     daily_trade_counts: dict = {}
     max_concurrent_seen = 0
+    risk_skipped_count = 0
 
     trades: list[TradeRecord] = []
 
@@ -515,12 +518,28 @@ def run(
                     # Volatility-normalised sizing
                     if use_volatility_sizing and has_atr and not np.isnan(atrs[i]) and atrs[i] > 0:
                         risk_per_contract = atrs[i] * point_value
-                        contracts = math.floor(risk_amount / risk_per_contract)
+                        contracts = max(1, math.floor(risk_amount / risk_per_contract))
                     else:
                         # Fallback: stop-distance sizing
                         stop_dist = abs(fill_price - stop_val)
                         if stop_dist > 0:
-                            contracts = math.floor(risk_amount / (stop_dist * point_value))
+                            contracts = max(1, math.floor(risk_amount / (stop_dist * point_value)))
+
+                    # Contract-level risk constraint: skip if 1-contract
+                    # minimum would exceed max allowed risk per trade.
+                    if contracts >= 1 and max_risk_per_trade > 0:
+                        stop_dist_actual = abs(fill_price - stop_val)
+                        actual_risk = stop_dist_actual * contracts * point_value
+                        max_allowed = equity_mtm[i - 1] * max_risk_per_trade
+                        if actual_risk > max_allowed:
+                            log.debug(
+                                "Bar %d: risk gate — actual=$%.0f > max=$%.0f "
+                                "(stop_dist=%.1f, ATR=%.1f), skipping",
+                                i, actual_risk, max_allowed,
+                                stop_dist_actual, atrs[i] if has_atr else 0,
+                            )
+                            contracts = 0
+                            risk_skipped_count += 1
 
                     if contracts >= 1:
                         entry_commission = commission_per_side * contracts
@@ -650,4 +669,5 @@ def run(
         halt_bar_index=halt_bar_index,
         daily_trade_counts=daily_trade_counts,
         max_concurrent_positions=max_concurrent_seen,
+        risk_skipped_count=risk_skipped_count,
     )

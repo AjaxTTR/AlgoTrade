@@ -224,6 +224,18 @@ def simulate_prop_firm(
     pass_days = [s["days_elapsed"] for s in sims if s["outcome"] == "PASS"]
     avg_days_to_pass = float(np.mean(pass_days)) if pass_days else 0.0
 
+    # Time-to-pass distribution
+    if pass_days:
+        ttp_pctiles = [10, 25, 50, 75, 90]
+        ttp_vals = np.percentile(pass_days, ttp_pctiles)
+        days_distribution = {
+            f"ttp_p{p}": round(float(v), 1) for p, v in zip(ttp_pctiles, ttp_vals)
+        }
+        days_distribution["min"] = round(float(min(pass_days)), 1)
+        days_distribution["max"] = round(float(max(pass_days)), 1)
+    else:
+        days_distribution = {}
+
     # Percentile breakdown: drawdown distribution
     pctiles = [5, 25, 50, 75, 95]
     peak_dds = np.array([s["peak_dd_pct"] for s in sims])
@@ -260,10 +272,327 @@ def simulate_prop_firm(
         "drawdown_distribution": {
             f"dd_p{p}": round(float(v), 2) for p, v in zip(pctiles, dd_pct_vals)
         },
+        "days_distribution": days_distribution,
         "actual": actual,
         "n_simulations": n_simulations,
         "config": cfg,
     }
+
+
+def _simulate_two_phase(
+    pnls: np.ndarray,
+    trade_dates: np.ndarray,
+    phase1_config: dict,
+    phase2_config: dict,
+) -> dict:
+    """Run a two-phase prop firm challenge on one trade sequence.
+
+    Phase 1 runs first.  If it passes, balance and drawdown reset to
+    starting_balance and Phase 2 runs on the REMAINING trades.
+
+    Returns dict with overall outcome, per-phase details, and timing.
+    """
+    # Phase 1
+    p1 = _simulate_single(pnls, trade_dates, phase1_config)
+
+    if p1["outcome"] != "PASS":
+        return {
+            "outcome": "FAIL",
+            "failed_phase": 1,
+            "reason": p1["reason"],
+            "p1": p1,
+            "p2": None,
+            "total_days": p1["days_elapsed"],
+            "total_trades": p1["trades_taken"],
+        }
+
+    # Phase 2: use remaining trades after Phase 1 consumed some
+    consumed = p1["trades_taken"]
+    if consumed >= len(pnls):
+        # No trades left for Phase 2
+        return {
+            "outcome": "FAIL",
+            "failed_phase": 2,
+            "reason": "trades_exhausted",
+            "p1": p1,
+            "p2": {"outcome": "FAIL", "reason": "trades_exhausted",
+                   "final_equity": phase2_config["starting_balance"],
+                   "peak_dd_pct": 0.0, "days_elapsed": 0, "trades_taken": 0},
+            "total_days": p1["days_elapsed"],
+            "total_trades": consumed,
+        }
+
+    remaining_pnls = pnls[consumed:]
+    remaining_dates = trade_dates[consumed:]
+
+    p2 = _simulate_single(remaining_pnls, remaining_dates, phase2_config)
+
+    total_days = p1["days_elapsed"] + p2["days_elapsed"]
+    total_trades = p1["trades_taken"] + p2["trades_taken"]
+
+    if p2["outcome"] == "PASS":
+        return {
+            "outcome": "PASS",
+            "failed_phase": 0,
+            "reason": "both_passed",
+            "p1": p1,
+            "p2": p2,
+            "total_days": total_days,
+            "total_trades": total_trades,
+        }
+    else:
+        return {
+            "outcome": "FAIL",
+            "failed_phase": 2,
+            "reason": p2["reason"],
+            "p1": p1,
+            "p2": p2,
+            "total_days": total_days,
+            "total_trades": total_trades,
+        }
+
+
+def simulate_prop_firm_2phase(
+    result: BacktestResult,
+    phase1_config: dict | None = None,
+    phase2_config: dict | None = None,
+    n_simulations: int = 5000,
+    seed: int | None = None,
+) -> dict:
+    """Monte Carlo two-phase prop firm challenge simulation.
+
+    Phase 1: hit profit target (e.g. +10%), DD limits enforced.
+    If passed, balance and drawdown RESET to starting_balance.
+    Phase 2: hit second target (e.g. +5%), same DD limits.
+
+    Trades are shuffled once per sim; Phase 2 uses remaining trades
+    after Phase 1 consumed its share.
+
+    Parameters
+    ----------
+    result : BacktestResult
+        Output from ``backtester.run()``.
+    phase1_config : dict
+        Phase 1 rules (starting_balance, profit_target, dd limits, max_days).
+    phase2_config : dict
+        Phase 2 rules (same structure; starting_balance should match Phase 1).
+    n_simulations : int
+        Number of shuffled simulations (default 5000).
+    seed : int | None
+        RNG seed for reproducibility.
+
+    Returns
+    -------
+    dict
+        overall_pass_rate, phase1_pass_rate, phase2_pass_rate (conditional),
+        fail breakdown, timing distributions, per-sim details.
+    """
+    p1_cfg = {**DEFAULT_CONFIG, **(phase1_config or {})}
+    p2_cfg = {**DEFAULT_CONFIG, **(phase2_config or {})}
+    trades = result.trades
+
+    if len(trades) < 2:
+        return _empty_2phase_result(p1_cfg, p2_cfg)
+
+    rng = np.random.default_rng(seed)
+    pnls = np.array([t.pnl for t in trades])
+    exit_dates = np.array([t.exit_time.date() for t in trades])
+
+    # Date template for shuffled trades (preserve day structure)
+    unique_dates = np.unique(exit_dates)
+    trades_per_day = np.array([np.sum(exit_dates == d) for d in unique_dates])
+    day_boundaries = np.concatenate([[0], np.cumsum(trades_per_day)])
+
+    shuffled_dates_template = np.empty(len(pnls), dtype=exit_dates.dtype)
+    for d_idx, d in enumerate(unique_dates):
+        start, end = day_boundaries[d_idx], day_boundaries[d_idx + 1]
+        shuffled_dates_template[start:end] = d
+
+    # Actual (unshuffled)
+    actual = _simulate_two_phase(pnls, exit_dates, p1_cfg, p2_cfg)
+
+    # Monte Carlo
+    sims = []
+    for _ in range(n_simulations):
+        shuffled_idx = rng.permutation(len(pnls))
+        shuffled_pnls = pnls[shuffled_idx]
+        sims.append(_simulate_two_phase(
+            shuffled_pnls, shuffled_dates_template, p1_cfg, p2_cfg
+        ))
+
+    # Aggregate
+    n_overall_pass = sum(1 for s in sims if s["outcome"] == "PASS")
+    n_p1_pass = sum(1 for s in sims if s["p1"]["outcome"] == "PASS")
+    n_p2_pass = sum(1 for s in sims if s["outcome"] == "PASS")  # both passed
+
+    overall_pass_rate = n_overall_pass / n_simulations * 100
+    p1_pass_rate = n_p1_pass / n_simulations * 100
+    # Phase 2 pass rate is conditional: of those that passed Phase 1
+    p2_conditional_rate = (n_p2_pass / n_p1_pass * 100) if n_p1_pass > 0 else 0.0
+
+    # Timing
+    pass_total_days = [s["total_days"] for s in sims if s["outcome"] == "PASS"]
+    p1_pass_days = [s["p1"]["days_elapsed"] for s in sims if s["p1"]["outcome"] == "PASS"]
+    p2_pass_days = [s["p2"]["days_elapsed"] for s in sims
+                    if s["outcome"] == "PASS" and s["p2"] is not None]
+
+    def _percentiles(data, label):
+        if not data:
+            return {}
+        arr = np.array(data)
+        pcts = [10, 25, 50, 75, 90]
+        vals = np.percentile(arr, pcts)
+        d = {f"{label}_p{p}": round(float(v), 1) for p, v in zip(pcts, vals)}
+        d[f"{label}_min"] = round(float(arr.min()), 1)
+        d[f"{label}_max"] = round(float(arr.max()), 1)
+        d[f"{label}_mean"] = round(float(arr.mean()), 1)
+        return d
+
+    # Failure breakdown
+    fail_p1_reasons = {}
+    fail_p2_reasons = {}
+    for s in sims:
+        if s["outcome"] == "FAIL":
+            if s["failed_phase"] == 1:
+                r = s["reason"]
+                fail_p1_reasons[r] = fail_p1_reasons.get(r, 0) + 1
+            elif s["failed_phase"] == 2:
+                r = s["reason"]
+                fail_p2_reasons[r] = fail_p2_reasons.get(r, 0) + 1
+
+    n_fail_p1 = sum(fail_p1_reasons.values())
+    n_fail_p2 = sum(fail_p2_reasons.values())
+
+    # DD-specific failure counts
+    p1_dd_fails = fail_p1_reasons.get("max_dd", 0) + fail_p1_reasons.get("daily_dd", 0)
+    p2_dd_fails = fail_p2_reasons.get("max_dd", 0) + fail_p2_reasons.get("daily_dd", 0)
+
+    # CI
+    overall_ci = _wilson_ci(n_overall_pass, n_simulations)
+
+    return {
+        "overall_pass_rate": round(overall_pass_rate, 2),
+        "overall_pass_rate_ci": overall_ci,
+        "phase1_pass_rate": round(p1_pass_rate, 2),
+        "phase2_conditional_pass_rate": round(p2_conditional_rate, 2),
+        "fail_in_phase1": n_fail_p1,
+        "fail_in_phase2": n_fail_p2,
+        "fail_in_phase1_pct": round(n_fail_p1 / n_simulations * 100, 2),
+        "fail_in_phase2_pct": round(n_fail_p2 / n_simulations * 100, 2),
+        "p1_dd_fail_pct": round(p1_dd_fails / n_simulations * 100, 2),
+        "p2_dd_fail_pct": round(p2_dd_fails / n_simulations * 100, 2) if n_p1_pass > 0 else 0.0,
+        "fail_p1_reasons": fail_p1_reasons,
+        "fail_p2_reasons": fail_p2_reasons,
+        "total_days_dist": _percentiles(pass_total_days, "total"),
+        "p1_days_dist": _percentiles(p1_pass_days, "p1"),
+        "p2_days_dist": _percentiles(p2_pass_days, "p2"),
+        "actual": actual,
+        "n_simulations": n_simulations,
+        "phase1_config": p1_cfg,
+        "phase2_config": p2_cfg,
+    }
+
+
+def _empty_2phase_result(p1_cfg: dict, p2_cfg: dict) -> dict:
+    """Return safe empty result for insufficient trades."""
+    return {
+        "overall_pass_rate": 0.0,
+        "overall_pass_rate_ci": (0.0, 0.0),
+        "phase1_pass_rate": 0.0,
+        "phase2_conditional_pass_rate": 0.0,
+        "fail_in_phase1": 0,
+        "fail_in_phase2": 0,
+        "fail_in_phase1_pct": 100.0,
+        "fail_in_phase2_pct": 0.0,
+        "p1_dd_fail_pct": 0.0,
+        "p2_dd_fail_pct": 0.0,
+        "fail_p1_reasons": {"insufficient_trades": 1},
+        "fail_p2_reasons": {},
+        "total_days_dist": {},
+        "p1_days_dist": {},
+        "p2_days_dist": {},
+        "actual": {"outcome": "FAIL", "failed_phase": 1, "reason": "insufficient_trades",
+                   "p1": None, "p2": None, "total_days": 0, "total_trades": 0},
+        "n_simulations": 0,
+        "phase1_config": p1_cfg,
+        "phase2_config": p2_cfg,
+    }
+
+
+def print_prop_firm_2phase(pf: dict) -> None:
+    """Pretty-print two-phase prop firm simulation results."""
+    p1_cfg = pf["phase1_config"]
+    p2_cfg = pf["phase2_config"]
+    ci = pf["overall_pass_rate_ci"]
+
+    print("\n" + "=" * 70)
+    print("  TWO-PHASE PROP FIRM CHALLENGE SIMULATION")
+    print("=" * 70)
+
+    print(f"  Phase 1: ${p1_cfg['starting_balance']:,.0f} -> "
+          f"+{p1_cfg['profit_target']*100:.0f}%  |  "
+          f"Max DD: {p1_cfg['max_drawdown_limit']*100:.0f}%  |  "
+          f"Daily DD: {p1_cfg['daily_drawdown_limit']*100:.0f}%")
+    print(f"  Phase 2: ${p2_cfg['starting_balance']:,.0f} -> "
+          f"+{p2_cfg['profit_target']*100:.0f}%  |  "
+          f"Max DD: {p2_cfg['max_drawdown_limit']*100:.0f}%  |  "
+          f"Daily DD: {p2_cfg['daily_drawdown_limit']*100:.0f}%")
+    print(f"  (Balance & DD reset between phases)")
+
+    print("\n  " + "-" * 66)
+    print(f"  {'Simulations':35s} {pf['n_simulations']:>10,d}")
+    print(f"  {'OVERALL PASS RATE (P1 + P2)':35s} {pf['overall_pass_rate']:>9.1f}%")
+    print(f"  {'95% CI':35s}  [{ci[0]:.1f}% - {ci[1]:.1f}%]")
+    print(f"  {'Phase 1 pass rate':35s} {pf['phase1_pass_rate']:>9.1f}%")
+    print(f"  {'Phase 2 pass rate (conditional)':35s} {pf['phase2_conditional_pass_rate']:>9.1f}%")
+
+    print("\n  " + "-" * 66)
+    print(f"  {'Failed in Phase 1':35s} {pf['fail_in_phase1_pct']:>9.1f}%")
+    print(f"  {'  ...due to drawdown':35s} {pf['p1_dd_fail_pct']:>9.1f}%")
+    print(f"  {'Failed in Phase 2':35s} {pf['fail_in_phase2_pct']:>9.1f}%")
+    print(f"  {'  ...due to drawdown':35s} {pf['p2_dd_fail_pct']:>9.1f}%")
+
+    if pf["fail_p1_reasons"]:
+        print("\n  Phase 1 failure breakdown:")
+        for reason, count in sorted(pf["fail_p1_reasons"].items(), key=lambda x: -x[1]):
+            pct = count / pf["n_simulations"] * 100
+            print(f"    {reason:30s} {count:>5,d}  ({pct:.1f}%)")
+
+    if pf["fail_p2_reasons"]:
+        print("\n  Phase 2 failure breakdown:")
+        for reason, count in sorted(pf["fail_p2_reasons"].items(), key=lambda x: -x[1]):
+            pct = count / pf["n_simulations"] * 100
+            print(f"    {reason:30s} {count:>5,d}  ({pct:.1f}%)")
+
+    # Timing
+    td = pf.get("total_days_dist", {})
+    p1d = pf.get("p1_days_dist", {})
+    p2d = pf.get("p2_days_dist", {})
+
+    if td:
+        print("\n  " + "-" * 66)
+        print("  TIMING (passing simulations only)")
+        print(f"  {'':35s} {'Med':>6s} {'Mean':>6s} {'P10':>6s} {'P90':>6s}")
+        print(f"  {'Phase 1 days':35s} "
+              f"{p1d.get('p1_p50', 0):>6.0f} {p1d.get('p1_mean', 0):>6.0f} "
+              f"{p1d.get('p1_p10', 0):>6.0f} {p1d.get('p1_p90', 0):>6.0f}")
+        print(f"  {'Phase 2 days':35s} "
+              f"{p2d.get('p2_p50', 0):>6.0f} {p2d.get('p2_mean', 0):>6.0f} "
+              f"{p2d.get('p2_p10', 0):>6.0f} {p2d.get('p2_p90', 0):>6.0f}")
+        print(f"  {'TOTAL days (P1 + P2)':35s} "
+              f"{td.get('total_p50', 0):>6.0f} {td.get('total_mean', 0):>6.0f} "
+              f"{td.get('total_p10', 0):>6.0f} {td.get('total_p90', 0):>6.0f}")
+
+    # Actual
+    act = pf.get("actual", {})
+    print("\n  " + "-" * 66)
+    print(f"  {'Actual outcome':35s} {act.get('outcome', 'N/A'):>10s}")
+    if act.get("outcome") == "FAIL":
+        print(f"  {'Actual failed phase':35s} {act.get('failed_phase', 'N/A'):>10}")
+    print(f"  {'Actual total days':35s} {act.get('total_days', 0):>10d}")
+    print(f"  {'Actual total trades':35s} {act.get('total_trades', 0):>10d}")
+
+    print("=" * 70 + "\n")
 
 
 def _empty_result(cfg: dict) -> dict:
@@ -283,6 +612,7 @@ def _empty_result(cfg: dict) -> dict:
             "dd_p5": 0.0, "dd_p25": 0.0, "dd_p50": 0.0,
             "dd_p75": 0.0, "dd_p95": 0.0,
         },
+        "days_distribution": {},
         "actual": {"outcome": "FAIL", "reason": "insufficient_trades",
                    "final_equity": cfg["starting_balance"], "peak_dd_pct": 0.0,
                    "days_elapsed": 0, "trades_taken": 0},
@@ -315,6 +645,15 @@ def print_prop_firm(pf: dict) -> None:
     print(f"  {'95% CI':30s}  [{ci[0]:.1f}% - {ci[1]:.1f}%]")
     print(f"  {'Fail Rate':30s} {pf['fail_rate']:>9.1f}%")
     print(f"  {'Avg Days to Pass':30s} {pf['avg_days_to_pass']:>10.1f}")
+
+    if pf.get("days_distribution"):
+        ttp = pf["days_distribution"]
+        print(f"  {'Median Days to Pass':30s} {ttp.get('ttp_p50', 0):>10.1f}")
+        print(f"  {'Days to Pass (10/25/75/90p)':30s}  "
+              f"{ttp.get('ttp_p10', 0):.0f} / {ttp.get('ttp_p25', 0):.0f} / "
+              f"{ttp.get('ttp_p75', 0):.0f} / {ttp.get('ttp_p90', 0):.0f}")
+        print(f"  {'Days Range (min-max)':30s}  "
+              f"{ttp.get('min', 0):.0f} - {ttp.get('max', 0):.0f}")
 
     if pf["fail_reasons"]:
         print("\n  Failure breakdown:")

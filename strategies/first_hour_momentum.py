@@ -1,31 +1,22 @@
 """
-First-Hour Momentum strategy.
+First-Hour Momentum strategy (long only, edge-filtered).
 
-Edge: when the first hour (09:30-10:30) shows a strong positive move,
+Edge: when the first 30 minutes (09:30-10:00) show a strong positive move,
 the rest of the day tends to continue upward.
 
 Source: ranked_edges.csv -- FH_Up -> Rest_Up (t=30.38, stability=0.946).
-Long only -- the short side showed weaker edge quality.
 
 Trade logic:
-  1. Bias filter: only trade on days where first-hour return is in the
-     top 20% historically (80th percentile, expanding window).
-  2. Early entry: if the first 30 minutes (09:30-10:00) already exceed
-     the threshold, enter at 10:00 instead of waiting until 10:30.
-  3. Standard entry: otherwise, enter at 10:30 after full first hour.
-  4. Pullback re-entries: after each trade exits (holding period),
-     re-enter long on pullback-and-recovery bars.
-  5. Midday continuation: after 11:00, enter on consolidation breakout
-     or higher-high after pullback, if aligned with first-hour bias.
-     Max 1 additional trade per day.
-  6. Max trades per day caps total entries.
+  1. Compute expanding 80th percentile of early_return (09:30-10:00)
+     from prior days only — positive returns only, no abs().
+  2. Compute ATR percentile (expanding rank) as volatility regime filter.
+  3. A day qualifies only if early_return exceeds the dynamic threshold
+     AND ATR percentile >= 60 (sufficient volatility).
+  4. Enter long at 10:00 (Tier 1) with full size. No fallback entry.
+  5. At most 1 trade per day. Long only.
 
-Every strategy module in /strategies must expose:
-
+Every strategy module must expose:
     def generate_signals(df: pd.DataFrame, **params) -> pd.DataFrame
-
-The returned DataFrame must include a ``signal`` column
-(1 = long, -1 = short, 0 = flat) and a ``stop_price`` column.
 """
 
 import numpy as np
@@ -40,86 +31,56 @@ def generate_signals(
     early_end: str = "10:00",
     entry_cutoff: str = "15:45",
     fh_threshold: float = 0.0,
-    fh_percentile: float = 80.0,
     atr_period: int = 14,
     stop_atr_multiple: float = 1.5,
     tp_atr_multiple: float = 2.0,
-    holding_bars: int = 8,
-    max_trades_per_day: int = 3,
-    pullback_atr_frac: float = 1.0,
-    enable_early_entry: bool = True,
-    enable_short: bool = False,
-    midday_start: str = "11:00",
-    midday_consol_bars: int = 4,
-    midday_consol_atr_frac: float = 1.0,
-    midday_pullback_atr_frac: float = 0.5,
-    max_midday_trades: int = 1,
-    min_bars_between_entries: int = 2,
+    fh_percentile: float = 80.0,
+    atr_percentile_min: float = 60.0,
     **kwargs,
 ) -> pd.DataFrame:
-    """First-Hour Momentum with early entry, pullback re-entries, and midday continuation.
+    """Generate long-only first-hour momentum signals.
 
     Parameters
     ----------
     df : pd.DataFrame
-        OHLCV data with a DatetimeIndex (15-min bars expected).
-    session_start / session_end / fh_end / entry_cutoff : str
-        Time boundaries for the session and first-hour window.
+        OHLCV data with DatetimeIndex (15-min bars expected).
+    session_start / session_end : str
+        RTH session boundaries.
+    fh_end : str
+        End of the full first-hour window (default "10:30").
     early_end : str
         End of the early observation window (default "10:00").
-        If the return from session_start to early_end already exceeds the
-        threshold, enter at early_end instead of waiting for fh_end.
+    entry_cutoff : str
+        Latest time to enter a new trade (default "15:45").
     fh_threshold : float
-        Hard minimum |fh_return| floor (default 0.0, disabled).
-    fh_percentile : float
-        Percentile of |fh_return| that today's move must exceed
-        (default 80.0 = top 20%).  Expanding window, no lookahead.
+        Hard minimum floor for early_return (default 0.0).
     atr_period : int
         Lookback for Average True Range (default 14).
     stop_atr_multiple : float
         Stop distance as ATR multiple (default 1.5).
     tp_atr_multiple : float
         Take-profit distance as ATR multiple (default 2.0).
-    holding_bars : int
-        Bars to hold each trade (default 8 = 2 hours on 15-min bars).
-    max_trades_per_day : int
-        Maximum entries per bias day (default 3).
-    pullback_atr_frac : float
-        Minimum pullback depth from running session high as a fraction
-        of ATR (default 0.5).
-    enable_early_entry : bool
-        If True, check 30-min return for early entry at early_end
-        (default True).  If False, always wait for fh_end.
-    midday_start : str
-        Earliest time for midday continuation entries (default "11:00").
-    midday_consol_bars : int
-        Number of prior bars to check for consolidation (default 4).
-    midday_consol_atr_frac : float
-        Max range of consolidation window as ATR fraction (default 1.0).
-        If the high-low range of the prior N bars is below this * ATR,
-        the market is consolidating.
-    midday_pullback_atr_frac : float
-        Min pullback from session high for higher-high trigger (default 0.5).
-    max_midday_trades : int
-        Max midday continuation entries per day (default 1).
-    min_bars_between_entries : int
-        Minimum bars between consecutive signal placements (default 2).
-        Controls signal spacing so the backtester can overlap positions.
+    fh_percentile : float
+        Percentile of early_return distribution used as dynamic threshold
+        (default 80.0 = only top 20% of early moves qualify).
+        Computed from prior days only — no lookahead.
+    atr_percentile_min : float
+        Minimum ATR percentile (0-100) required to trade (default 60.0).
+        Filters out low-volatility regimes where momentum follow-through
+        is weaker.
 
     Returns
     -------
     pd.DataFrame
         Copy of input with added columns: signal, stop_price, tp_price,
-        session_close, atr, fh_return, size_factor, signal_tier.
-        signal_tier: 1 = early entry, 2 = standard entry, 3 = pullback,
-                     4 = midday continuation.
+        session_close, atr, fh_return, size_factor, signal_tier,
+        entry_type, early_return_threshold, is_top_percentile,
+        fh_rank_percentile, atr_percentile, is_high_vol.
     """
     out = df.copy()
     n = len(out)
 
-    # ------------------------------------------------------------------
-    # ATR (for stop/TP sizing)
-    # ------------------------------------------------------------------
+    # -- ATR (for stop/TP sizing) --
     prev_close = out["close"].shift(1)
     tr = np.maximum(
         out["high"] - out["low"],
@@ -130,33 +91,33 @@ def generate_signals(
     )
     out["atr"] = tr.ewm(alpha=1.0 / atr_period, min_periods=atr_period, adjust=False).mean()
 
-    # ------------------------------------------------------------------
-    # Time masks
-    # ------------------------------------------------------------------
+    # -- ATR percentile (volatility regime filter) --
+    # Expanding rank of current ATR vs all prior bars, scaled to 0-100.
+    out["atr_percentile"] = out["atr"].expanding(min_periods=atr_period).rank(pct=True) * 100.0
+    out["is_high_vol"] = out["atr_percentile"] >= atr_percentile_min
+
+    # -- Time boundaries --
     time = out.index.time
     t_session_start = pd.Timestamp(session_start).time()
     t_early_end = pd.Timestamp(early_end).time()
-    t_fh_end = pd.Timestamp(fh_end).time()
     t_session_end = pd.Timestamp(session_end).time()
     t_entry_cutoff = pd.Timestamp(entry_cutoff).time()
-    t_midday_start = pd.Timestamp(midday_start).time()
 
     out["date"] = out.index.date
 
-    # ------------------------------------------------------------------
-    # Session close flag (15:45 EOD backstop)
-    # ------------------------------------------------------------------
+    # -- Daily ATR percentile: use the last bar before entry (just before 10:00) --
+    # This is the ATR percentile the strategy sees at decision time.
+    pre_entry = out[(time >= t_session_start) & (time < t_early_end)]
+    daily_atr_pctile = pre_entry.groupby("date")["atr_percentile"].last()
+
+    # -- Session close flag (EOD backstop at entry_cutoff) --
     past_cutoff = time >= t_entry_cutoff
     new_day = out["date"] != pd.Series(out["date"]).shift(1).values
     prev_past = pd.Series(past_cutoff).shift(1, fill_value=False).values
     out["session_close"] = past_cutoff & (~prev_past | new_day)
 
-    # ------------------------------------------------------------------
-    # First-hour return per day (full 60 min, no lookahead)
-    # Used for: threshold computation (expanding percentile) and
-    #           standard 10:30 entry decision.
-    # ------------------------------------------------------------------
-    in_fh = (time >= t_session_start) & (time < t_fh_end)
+    # -- First-hour return (full 60 min, 09:30-10:30) — kept as info column --
+    in_fh = (time >= t_session_start) & (time < pd.Timestamp(fh_end).time())
     fh_bars = out[in_fh]
     fh_open = fh_bars.groupby("date")["open"].first()
     fh_close = fh_bars.groupby("date")["close"].last()
@@ -164,165 +125,93 @@ def generate_signals(
     fh_return.name = "fh_return"
     out["fh_return"] = out["date"].map(fh_return)
 
-    # ------------------------------------------------------------------
-    # Early return per day (first 30 min: 09:30-10:00)
-    # Used for: early entry decision at 10:00.
-    # ------------------------------------------------------------------
+    # -- Early return (first 30 min, 09:30-10:00) --
+    # This is the SOLE basis for threshold and filtering.
     in_early = (time >= t_session_start) & (time < t_early_end)
     early_bars = out[in_early]
     early_open = early_bars.groupby("date")["open"].first()
     early_close = early_bars.groupby("date")["close"].last()
     early_return = (early_close - early_open) / early_open
-    early_return.name = "early_return"
-    out["early_return"] = out["date"].map(early_return)
 
-    # ------------------------------------------------------------------
-    # Adaptive threshold: expanding percentile of |fh_return|
-    # Built from FULL first-hour returns (60 min) of prior days.
-    # The same threshold is used for both early and standard entries.
-    # ------------------------------------------------------------------
-    MIN_HISTORY = 20
-    fh_abs = fh_return.abs()
-    daily_dates = fh_abs.index
+    # -- Expanding percentile threshold on early_return (no lookahead) --
+    # No abs() — only positive early returns matter for a long-only strategy.
+    # shift(1) ensures today's return is excluded from its own threshold.
+    _MIN_HISTORY = 20
+    daily_dates = early_return.index
 
-    if fh_percentile > 0 and len(daily_dates) > MIN_HISTORY:
-        expanding_thresh = fh_abs.expanding(min_periods=MIN_HISTORY).quantile(
-            fh_percentile / 100.0
-        ).shift(1)
-    else:
-        expanding_thresh = pd.Series(np.nan, index=daily_dates)
+    dynamic_thresh = early_return.expanding(min_periods=_MIN_HISTORY).quantile(
+        fh_percentile / 100.0
+    ).shift(1)
 
-    out["fh_pctile_thresh"] = out["date"].map(expanding_thresh)
-    out["fh_eff_thresh"] = out["fh_pctile_thresh"].fillna(fh_threshold).clip(lower=fh_threshold)
+    # Map daily threshold to every bar
+    out["early_return_threshold"] = out["date"].map(dynamic_thresh)
 
-    # ------------------------------------------------------------------
-    # Running session high and low (for pullback detection)
-    # ------------------------------------------------------------------
-    session_high = np.full(n, np.nan)
-    session_low = np.full(n, np.nan)
-    current_high = np.nan
-    current_low = np.nan
-    current_date = None
-    for i in range(n):
-        d = out["date"].iloc[i]
-        t = time[i]
-        if d != current_date:
-            current_date = d
-            current_high = np.nan
-            current_low = np.nan
-        if t >= t_session_start and t < t_session_end:
-            h = out["high"].iloc[i]
-            l_val = out["low"].iloc[i]
-            if np.isnan(current_high) or h > current_high:
-                current_high = h
-            if np.isnan(current_low) or l_val < current_low:
-                current_low = l_val
-            session_high[i] = current_high
-            session_low[i] = current_low
-    out["session_high"] = session_high
-    out["session_low"] = session_low
+    # -- Debug: rank percentile of today's early_return vs prior days --
+    # Approximate — uses expanding rank which includes today, acceptable for debug.
+    rank_pctile = early_return.expanding(min_periods=_MIN_HISTORY).rank(pct=True) * 100.0
+    out["fh_rank_percentile"] = out["date"].map(rank_pctile)
 
-    # ------------------------------------------------------------------
-    # Track whether a pullback from session high has occurred (per bar)
-    # A pullback means price dipped >= midday_pullback_atr_frac * ATR
-    # from the running session high at some point during the day.
-    # ------------------------------------------------------------------
-    atr_vals = out["atr"].values
-    low_vals = out["low"].values
-    had_pullback = np.zeros(n, dtype=bool)
-    pullback_active = False
-    current_date_pb = None
-    for i in range(n):
-        d = out["date"].iloc[i]
-        t = time[i]
-        if d != current_date_pb:
-            current_date_pb = d
-            pullback_active = False
-        if t >= t_session_start and t < t_session_end:
-            sh = session_high[i]
-            atr_val = atr_vals[i]
-            if not np.isnan(sh) and not np.isnan(atr_val) and atr_val > 0:
-                dip = sh - low_vals[i]
-                if dip >= midday_pullback_atr_frac * atr_val:
-                    pullback_active = True
-        had_pullback[i] = pullback_active
-    out["had_pullback"] = had_pullback
-
-    # ------------------------------------------------------------------
-    # Identify bias days and early-eligible days
-    #
-    # long_bias_days:  fh_return > +threshold  (bullish continuation)
-    # short_bias_days: fh_return < -threshold  (bearish continuation)
-    # early_days: early_return (first 30 min) > threshold (long only)
-    # ------------------------------------------------------------------
-    long_bias_days = set()
-    short_bias_days = set()
+    # -- Classify days --
+    # A day qualifies only if:
+    #   1. early_return exceeds the dynamic threshold AND hard floor
+    #   2. ATR percentile at decision time >= atr_percentile_min
+    out["is_top_percentile"] = False
     early_days = set()
+
     for d in daily_dates:
-        thresh_val = expanding_thresh.get(d, np.nan)
-        eff = max(thresh_val if not pd.isna(thresh_val) else fh_threshold, fh_threshold)
+        thresh = dynamic_thresh.get(d, np.nan)
+        if pd.isna(thresh):
+            continue
+        eff_thresh = max(thresh, fh_threshold)
 
-        fhr = fh_return.get(d, np.nan)
-        if not pd.isna(fhr):
-            if fhr > eff:
-                long_bias_days.add(d)
-            elif enable_short and fhr < -eff:
-                short_bias_days.add(d)
+        er = early_return.get(d, np.nan)
+        if pd.isna(er) or er < eff_thresh:
+            continue
 
-        if enable_early_entry:
-            er = early_return.get(d, np.nan)
-            if not pd.isna(er) and er > eff:
-                early_days.add(d)
+        atr_pct = daily_atr_pctile.get(d, np.nan)
+        if pd.isna(atr_pct) or atr_pct < atr_percentile_min:
+            continue
 
-    # ------------------------------------------------------------------
-    # Signal generation
-    #
-    # For each day:
-    #   1. If early_days: enter at first bar at/after early_end (tier=1)
-    #   2. Elif bias_days: enter at first bar at/after fh_end (tier=2)
-    #   3. Pullback re-entries after each trade exits (tier=3)
-    # ------------------------------------------------------------------
+        early_days.add(d)
+
+    # Mark qualifying days on all their bars
+    is_top = out["date"].isin(early_days)
+    out.loc[is_top, "is_top_percentile"] = True
+
+    # -- Signal output columns --
     out["signal"] = 0
     out["stop_price"] = np.nan
     out["tp_price"] = np.nan
     out["size_factor"] = 1.0
     out["signal_tier"] = 0
+    out["entry_type"] = ""
 
     sig_col = out.columns.get_loc("signal")
     stop_col = out.columns.get_loc("stop_price")
     tp_col = out.columns.get_loc("tp_price")
     sf_col = out.columns.get_loc("size_factor")
     tier_col = out.columns.get_loc("signal_tier")
-    sc_col = out.columns.get_loc("session_close")
+    et_col = out.columns.get_loc("entry_type")
 
-    opens = out["open"].values
     closes = out["close"].values
-    highs = out["high"].values
-    lows = out["low"].values
     atrs = out["atr"].values
     dates = out["date"].values
-    sess_highs = out["session_high"].values
-    sess_lows = out["session_low"].values
-    had_pb = out["had_pullback"].values
 
-    def _place_signal(idx, tier, direction=1):
-        """Place a signal at bar idx, return True if successful."""
+    def _place_long(idx):
+        """Place a Tier 1 long signal at bar idx. Returns True if successful."""
         atr_val = atrs[idx]
         if pd.isna(atr_val) or atr_val <= 0:
             return False
-        entry_px = closes[idx]
-        out.iloc[idx, sig_col] = direction
-        if direction == 1:
-            out.iloc[idx, stop_col] = entry_px - (atr_val * stop_atr_multiple)
-            out.iloc[idx, tp_col] = entry_px + (atr_val * tp_atr_multiple)
-        else:
-            out.iloc[idx, stop_col] = entry_px + (atr_val * stop_atr_multiple)
-            out.iloc[idx, tp_col] = entry_px - (atr_val * tp_atr_multiple)
+        px = closes[idx]
+        out.iloc[idx, sig_col] = 1
+        out.iloc[idx, stop_col] = px - atr_val * stop_atr_multiple
+        out.iloc[idx, tp_col] = px + atr_val * tp_atr_multiple
         out.iloc[idx, sf_col] = 1.0
-        out.iloc[idx, tier_col] = tier
+        out.iloc[idx, tier_col] = 1
+        out.iloc[idx, et_col] = "early"
         return True
 
-    # Group bars by date
+    # -- Group bars by date for fast iteration --
     date_bar_ranges = {}
     current_d = None
     start_i = 0
@@ -336,198 +225,39 @@ def generate_signals(
     if current_d is not None:
         date_bar_ranges[current_d] = (start_i, n)
 
-    # All tradeable days = union of long bias, short bias, and early days
-    all_trade_days = long_bias_days | short_bias_days | early_days
-
-    for d in sorted(all_trade_days):
+    # -- Generate signals: Tier 1 only, 1 trade per day max --
+    for d in sorted(early_days):
         if d not in date_bar_ranges:
             continue
         d_start, d_end = date_bar_ranges[d]
-        trades_today = 0
-        initial_signal_idx = None
-        initial_tier = None
 
-        # A day is either long or short, never both
-        is_long_day = d in long_bias_days or d in early_days
-        is_short_day = d in short_bias_days
-
-        # ==============================================================
-        # LONG-SIDE ENTRIES (Tiers 1-4)
-        # ==============================================================
-        if is_long_day:
-            # --- Try early entry (10:00, Tier 1) ---
-            if d in early_days:
-                for i in range(d_start, d_end):
-                    t = time[i]
-                    if t >= t_early_end and t < t_entry_cutoff and t >= t_session_start and t < t_session_end:
-                        if _place_signal(i, tier=1, direction=1):
-                            initial_signal_idx = i
-                            initial_tier = 1
-                            trades_today = 1
-                        break
-
-            # --- Fallback: standard long entry (10:30, Tier 2) ---
-            if initial_signal_idx is None and d in long_bias_days:
-                for i in range(d_start, d_end):
-                    t = time[i]
-                    if t >= t_fh_end and t < t_entry_cutoff and t >= t_session_start and t < t_session_end:
-                        if _place_signal(i, tier=2, direction=1):
-                            initial_signal_idx = i
-                            initial_tier = 2
-                            trades_today = 1
-                        break
-
-            if initial_signal_idx is None:
-                continue
-
-            next_eligible = initial_signal_idx + min_bars_between_entries
-
-            # --- Long pullback re-entry (Tier 3): only after Tier 2 ---
-            if initial_tier == 2 and trades_today < max_trades_per_day:
-                pullback_confirmed = False
-                for i in range(max(next_eligible, d_start), d_end):
-                    t = time[i]
-                    if t >= t_entry_cutoff or t >= t_session_end:
-                        break
-                    atr_val = atrs[i]
-                    if pd.isna(atr_val) or atr_val <= 0:
-                        continue
-                    sh = sess_highs[i]
-                    if pd.isna(sh):
-                        continue
-
-                    # Stage 1: pullback dip >= 1 ATR from session high, rejection close
-                    if not pullback_confirmed:
-                        pullback_depth = sh - lows[i]
-                        if pullback_depth >= pullback_atr_frac * atr_val:
-                            bar_range = highs[i] - lows[i]
-                            if bar_range > 0 and closes[i] >= lows[i] + 0.75 * bar_range:
-                                pullback_confirmed = True
-                        continue
-
-                    # Stage 2: strong bullish confirmation bar
-                    bar_range = highs[i] - lows[i]
-                    if bar_range <= 0 or bar_range < 0.25 * atr_val:
-                        continue
-                    if closes[i] <= opens[i]:
-                        continue
-                    if closes[i] < lows[i] + 0.75 * bar_range:
-                        continue
-
-                    if _place_signal(i, tier=3, direction=1):
-                        trades_today += 1
-                        next_eligible = i + min_bars_between_entries
-                        break
-
-            # --- Long midday continuation (Tier 4) ---
-            midday_trades = 0
-            while trades_today < max_trades_per_day and midday_trades < max_midday_trades:
-                found = False
-                for i in range(max(next_eligible, d_start), d_end):
-                    t = time[i]
-                    if t >= t_entry_cutoff or t >= t_session_end:
-                        break
-                    if t < t_midday_start:
-                        continue
-
-                    atr_val = atrs[i]
-                    if pd.isna(atr_val) or atr_val <= 0:
-                        continue
-
-                    midday_triggered = False
-
-                    # (A) Consolidation breakout
-                    if i >= midday_consol_bars:
-                        consol_high = np.max(highs[i - midday_consol_bars:i])
-                        consol_low = np.min(lows[i - midday_consol_bars:i])
-                        consol_range = consol_high - consol_low
-                        if consol_range < midday_consol_atr_frac * atr_val:
-                            if closes[i] > consol_high:
-                                midday_triggered = True
-
-                    # (B) Higher high after pullback
-                    if not midday_triggered and had_pb[i]:
-                        if i >= 1 and highs[i] > highs[i - 1]:
-                            bar_range = highs[i] - lows[i]
-                            if bar_range > 0 and closes[i] >= (highs[i] + lows[i]) / 2.0:
-                                midday_triggered = True
-
-                    if midday_triggered and _place_signal(i, tier=4, direction=1):
-                        midday_trades += 1
-                        trades_today += 1
-                        next_eligible = i + min_bars_between_entries
-                        found = True
-                        break
-
-                if not found:
-                    break
-
-        # ==============================================================
-        # SHORT-SIDE ENTRIES (Tiers 5-6)
-        # ==============================================================
-        elif is_short_day:
-            # --- Standard short entry (10:30, Tier 5) ---
-            for i in range(d_start, d_end):
-                t = time[i]
-                if t >= t_fh_end and t < t_entry_cutoff and t >= t_session_start and t < t_session_end:
-                    if _place_signal(i, tier=5, direction=-1):
-                        initial_signal_idx = i
-                        initial_tier = 5
-                        trades_today = 1
-                    break
-
-            if initial_signal_idx is None:
-                continue
-
-            next_eligible = initial_signal_idx + min_bars_between_entries
-
-            # --- Short pullback re-entry (Tier 6): only after Tier 5 ---
-            #
-            # Mirror of long Tier 3:
-            #   Stage 1: price retraces UP >= 1 ATR from session low,
-            #            close in bottom 25% of bar (rejection of upside).
-            #   Stage 2: strong bearish bar — close < open, close in
-            #            bottom 25% of range, range >= 0.25 ATR.
-            # Max 1 pullback per day.
-            if trades_today < max_trades_per_day:
-                pullback_confirmed = False
-                for i in range(max(next_eligible, d_start), d_end):
-                    t = time[i]
-                    if t >= t_entry_cutoff or t >= t_session_end:
-                        break
-                    atr_val = atrs[i]
-                    if pd.isna(atr_val) or atr_val <= 0:
-                        continue
-                    sl = sess_lows[i]
-                    if pd.isna(sl):
-                        continue
-
-                    # Stage 1: upward retrace >= 1 ATR from session low, rejection
-                    if not pullback_confirmed:
-                        retrace_depth = highs[i] - sl
-                        if retrace_depth >= pullback_atr_frac * atr_val:
-                            bar_range = highs[i] - lows[i]
-                            if bar_range > 0 and closes[i] <= lows[i] + 0.25 * bar_range:
-                                pullback_confirmed = True
-                        continue
-
-                    # Stage 2: strong bearish confirmation bar
-                    bar_range = highs[i] - lows[i]
-                    if bar_range <= 0 or bar_range < 0.25 * atr_val:
-                        continue
-                    if closes[i] >= opens[i]:
-                        continue
-                    if closes[i] > lows[i] + 0.25 * bar_range:
-                        continue
-
-                    if _place_signal(i, tier=6, direction=-1):
-                        trades_today += 1
-                        next_eligible = i + min_bars_between_entries
-                        break
+        # Enter at the first bar at or after 10:00
+        for i in range(d_start, d_end):
+            t = time[i]
+            if t >= t_early_end and t < t_entry_cutoff and t < t_session_end:
+                _place_long(i)
+                break
 
     # Clean up working columns
-    drop_cols = ["date", "fh_pctile_thresh", "fh_eff_thresh",
-                 "session_high", "session_low", "early_return", "had_pullback"]
-    out.drop(columns=[c for c in drop_cols if c in out.columns], inplace=True)
+    out.drop(columns=["date"], inplace=True)
+
+    # -- Validate output --
+    signal_bars = out[out["signal"] != 0]
+
+    invalid_vals = set(out["signal"].unique()) - {0, 1}
+    if invalid_vals:
+        raise ValueError(f"signal contains invalid values: {invalid_vals}. Expected {{0, 1}}.")
+
+    if signal_bars["signal"].isna().any():
+        raise ValueError("signal column contains NaN on signal bars.")
+
+    if signal_bars["stop_price"].isna().any():
+        bad = signal_bars[signal_bars["stop_price"].isna()].index.tolist()
+        raise ValueError(f"stop_price is NaN on {len(bad)} signal bar(s): {bad[:5]}")
+
+    signals_per_day = signal_bars.groupby(signal_bars.index.date).size()
+    multi = signals_per_day[signals_per_day > 1]
+    if len(multi) > 0:
+        raise ValueError(f"More than 1 signal on {len(multi)} day(s): {multi.index.tolist()[:5]}")
 
     return out

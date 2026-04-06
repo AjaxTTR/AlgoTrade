@@ -5,12 +5,19 @@ Splits data into rolling train/test windows, optimizes on train,
 tests on out-of-sample, and aggregates OOS results to detect
 overfitting.
 
+Modes:
+    default       — optimisation walk-forward (grid search on train, test OOS)
+    validation    — fixed baseline config, no optimisation, pure robustness test
+
 Usage:
     python -m research.walk_forward [strategy_name]
+    python -m research.walk_forward --mode validation
 """
 
+import argparse
 import importlib
 import itertools
+import json
 import logging
 import sys
 import time
@@ -71,6 +78,7 @@ PARAM_GRID = {
 }
 
 OUTPUT_PATH = Path("research/walk_forward_results.csv")
+VALIDATION_CONFIG_PATH = Path("configs/baseline_gap_fh_75.json")
 
 # Relaxed edge thresholds for fold-level checks (smaller sample windows)
 FOLD_EDGE_THRESHOLDS = {
@@ -344,11 +352,188 @@ def walk_forward(
     return results_df
 
 
+def walk_forward_validation() -> pd.DataFrame:
+    """Run walk-forward in validation mode: fixed config, no optimisation.
+
+    Uses the locked baseline config (configs/baseline_gap_fh_75.json).
+    Every fold runs the test window only — training data is ignored.
+    No folds are skipped for any reason.
+    """
+    t_start = time.perf_counter()
+
+    # Load baseline config
+    if not VALIDATION_CONFIG_PATH.exists():
+        log.error("Baseline config not found: %s", VALIDATION_CONFIG_PATH)
+        sys.exit(1)
+
+    with open(VALIDATION_CONFIG_PATH) as f:
+        cfg = json.load(f)
+
+    strategy_name = cfg.get("strategy_module", "gap_fh_continuation")
+    bt_cfg = {**BACKTEST_CONFIG, **cfg.get("backtest", {})}
+    st_cfg = {**BASE_STRATEGY_CONFIG, **cfg.get("strategy", {})}
+
+    log.info("VALIDATION MODE — fixed config, no optimisation")
+    log.info("Config: %s (v%s)", cfg.get("name", "?"), cfg.get("version", "?"))
+    log.info("Strategy: %s", strategy_name)
+
+    log.info("Loading data from %s", DATA_FILE)
+    df = load_csv(DATA_FILE)
+    log.info("Loaded %d bars: %s -> %s", len(df), df.index[0], df.index[-1])
+
+    strategy_module = importlib.import_module(f"strategies.{strategy_name}")
+
+    folds = _build_folds(df.index, TRAIN_MONTHS, TEST_MONTHS, STEP_MONTHS)
+    log.info("Walk-forward: %d folds (%dmo train / %dmo test / %dmo step)",
+             len(folds), TRAIN_MONTHS, TEST_MONTHS, STEP_MONTHS)
+
+    if not folds:
+        log.error("Not enough data for even one fold")
+        sys.exit(1)
+
+    fold_results = []
+
+    for i, (train_start, train_end, test_start, test_end) in enumerate(folds):
+        log.info("Fold %d/%d: test %s -> %s",
+                 i + 1, len(folds),
+                 test_start.strftime("%Y-%m-%d"), test_end.strftime("%Y-%m-%d"))
+
+        df_test = df[test_start:test_end]
+
+        if len(df_test) < 20:
+            log.warning("  Fold %d: only %d bars — running anyway", i + 1, len(df_test))
+
+        try:
+            signals = strategy_module.generate_signals(df_test.copy(), **st_cfg)
+            result = run_backtest(signals, **bt_cfg)
+            metrics = compute_metrics(result, initial_capital=bt_cfg["initial_capital"])
+
+            sharpe = metrics["mtm"]["sharpe"]
+            total_return = metrics["mtm"]["total_return"]
+            max_dd = metrics["mtm"]["max_drawdown"]
+            trades = metrics["trades"]["total_trades"]
+        except Exception as exc:
+            log.warning("  Fold %d failed: %s", i + 1, exc)
+            sharpe = 0.0
+            total_return = 0.0
+            max_dd = 0.0
+            trades = 0
+
+        log.info("  Sharpe: %.2f | Return: %.2f%% | DD: %.2f%% | Trades: %d",
+                 sharpe, total_return, max_dd, trades)
+
+        fold_results.append({
+            "fold": i + 1,
+            "test_start": test_start.strftime("%Y-%m-%d"),
+            "test_end": test_end.strftime("%Y-%m-%d"),
+            "sharpe": round(sharpe, 2),
+            "return": round(total_return, 2),
+            "max_dd": round(max_dd, 2),
+            "trades": trades,
+        })
+
+    results_df = pd.DataFrame(fold_results)
+
+    # Save
+    out_path = Path("research/walk_forward_validation.csv")
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    results_df.to_csv(out_path, index=False)
+    log.info("Results saved to %s", out_path)
+
+    # === Output ===
+    elapsed = time.perf_counter() - t_start
+
+    print()
+    print("=" * 70)
+    print("  WALK-FORWARD VALIDATION (FIXED BASELINE)")
+    print("=" * 70)
+    print(f"  Config:   {cfg.get('name', '?')} {cfg.get('version', '?')}")
+    print(f"  Strategy: {strategy_name}")
+    print(f"  Signal:   Gap Up + FH >= {st_cfg.get('fh_percentile', '?')}th pct")
+    print(f"  Stop:     {st_cfg.get('stop_atr_multiple', '?')}x ATR  |  "
+          f"TP: {st_cfg.get('tp_atr_multiple', '?')}R  |  "
+          f"Risk: {bt_cfg.get('risk_per_trade', 0)*100:.2f}%")
+    print(f"  Folds:    {len(results_df)}  "
+          f"({TRAIN_MONTHS}mo train / {TEST_MONTHS}mo test / {STEP_MONTHS}mo step)")
+    print()
+
+    # Per-fold table
+    print(f"  {'Fold':>4}  {'Test Window':<25}  {'Sharpe':>7}  {'Return':>8}  "
+          f"{'MaxDD':>7}  {'Trades':>6}")
+    print("  " + "-" * 68)
+
+    for _, r in results_df.iterrows():
+        window = f"{r['test_start']} -> {r['test_end']}"
+        sharpe_flag = " *" if r["sharpe"] < -0.5 else ""
+        print(f"  {r['fold']:>4}  {window:<25}  {r['sharpe']:>7.2f}{sharpe_flag}  "
+              f"{r['return']:>7.2f}%  {r['max_dd']:>7.2f}%  {r['trades']:>5}")
+
+    # Summary
+    print()
+    print("  " + "-" * 68)
+
+    n_folds = len(results_df)
+    avg_sharpe = results_df["sharpe"].mean()
+    worst_sharpe = results_df["sharpe"].min()
+    best_sharpe = results_df["sharpe"].max()
+    positive_folds = (results_df["sharpe"] > 0).sum()
+    positive_pct = positive_folds / n_folds * 100 if n_folds > 0 else 0
+    worst_dd = results_df["max_dd"].min()
+    avg_return = results_df["return"].mean()
+    total_trades = results_df["trades"].sum()
+    catastrophic = (results_df["sharpe"] < -0.5).sum()
+
+    print(f"  Average Sharpe:        {avg_sharpe:>7.2f}")
+    print(f"  Best Sharpe:           {best_sharpe:>7.2f}")
+    print(f"  Worst Sharpe:          {worst_sharpe:>7.2f}")
+    print(f"  Positive Sharpe folds: {positive_folds}/{n_folds}  ({positive_pct:.0f}%)")
+    print(f"  Worst drawdown:        {worst_dd:>7.2f}%")
+    print(f"  Average return/fold:   {avg_return:>7.2f}%")
+    print(f"  Total trades:          {total_trades:>5}")
+    print(f"  Runtime:               {elapsed:>7.1f}s")
+
+    # Verdict
+    print()
+    print("=" * 70)
+    print("  VERDICT")
+    print("=" * 70)
+
+    stable = positive_pct >= 70 and catastrophic == 0
+    if stable:
+        print(f"\n  STABLE")
+        print(f"    {positive_pct:.0f}% folds with positive Sharpe (>= 70% required)")
+        print(f"    {catastrophic} catastrophic folds (Sharpe < -0.5)")
+    else:
+        reasons = []
+        if positive_pct < 70:
+            reasons.append(f"only {positive_pct:.0f}% positive Sharpe folds (need >= 70%)")
+        if catastrophic > 0:
+            reasons.append(f"{catastrophic} catastrophic fold(s) with Sharpe < -0.5")
+        print(f"\n  UNSTABLE")
+        for r in reasons:
+            print(f"    - {r}")
+
+    print()
+    print("=" * 70)
+    print()
+
+    return results_df
+
+
 if __name__ == "__main__":
-    args = [a for a in sys.argv[1:] if not a.startswith("--")]
-    flags = [a for a in sys.argv[1:] if a.startswith("--")]
-    name = args[0] if args else "first_hour_momentum"
-    walk_forward(
-        name,
-        skip_edge_check="--skip-edge-check" in flags,
-    )
+    parser = argparse.ArgumentParser(description="Walk-forward analysis")
+    parser.add_argument("strategy", nargs="?", default="first_hour_momentum",
+                        help="Strategy module name (default: first_hour_momentum)")
+    parser.add_argument("--mode", default="default", choices=["default", "validation"],
+                        help="Mode: default (optimisation WF) or validation (fixed baseline)")
+    parser.add_argument("--skip-edge-check", action="store_true",
+                        help="Skip per-fold edge validation (default mode only)")
+    args = parser.parse_args()
+
+    if args.mode == "validation":
+        walk_forward_validation()
+    else:
+        walk_forward(
+            args.strategy,
+            skip_edge_check=args.skip_edge_check,
+        )
