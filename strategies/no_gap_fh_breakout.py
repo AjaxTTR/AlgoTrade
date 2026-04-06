@@ -27,8 +27,6 @@ def generate_signals(
     fh_end: str = "10:30",
     entry_cutoff: str = "15:45",
     atr_period: int = 14,
-    stop_atr_multiple: float = 1.0,
-    tp_atr_multiple: float = 1.0,
     fh_percentile: float = 75.0,
     gap_threshold_pct: float = 0.10,
     **kwargs,
@@ -72,32 +70,17 @@ def generate_signals(
 
     # -- Signal output columns --
     out["signal"] = 0
-    out["stop_price"] = np.nan
-    out["tp_price"] = np.nan
-    out["size_factor"] = 1.0
     out["signal_tier"] = 0
     out["entry_type"] = ""
 
     sig_col = out.columns.get_loc("signal")
-    stop_col = out.columns.get_loc("stop_price")
-    tp_col = out.columns.get_loc("tp_price")
-    sf_col = out.columns.get_loc("size_factor")
     tier_col = out.columns.get_loc("signal_tier")
     et_col = out.columns.get_loc("entry_type")
 
-    closes = out["close"].values
-    atrs = out["atr"].values
     dates = out["date"].values
 
     def _place_long(idx):
-        atr_val = atrs[idx]
-        if pd.isna(atr_val) or atr_val <= 0:
-            return False
-        px = closes[idx]
         out.iloc[idx, sig_col] = 1
-        out.iloc[idx, stop_col] = px - atr_val * stop_atr_multiple
-        out.iloc[idx, tp_col] = px + atr_val * tp_atr_multiple
-        out.iloc[idx, sf_col] = 1.0
         out.iloc[idx, tier_col] = 1
         out.iloc[idx, et_col] = "no_gap_breakout"
         return True
@@ -122,9 +105,6 @@ def generate_signals(
     invalid_vals = set(out["signal"].unique()) - {0, 1}
     if invalid_vals:
         raise ValueError(f"signal contains invalid values: {invalid_vals}.")
-    if signal_bars["stop_price"].isna().any():
-        bad = signal_bars[signal_bars["stop_price"].isna()].index.tolist()
-        raise ValueError(f"stop_price is NaN on {len(bad)} signal bar(s): {bad[:5]}")
     signals_per_day = signal_bars.groupby(signal_bars.index.date).size()
     multi = signals_per_day[signals_per_day > 1]
     if len(multi) > 0:

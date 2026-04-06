@@ -35,8 +35,6 @@ STRATEGY_PARAMS = {
     "fh_end": "10:30",
     "entry_cutoff": "15:45",
     "atr_period": 14,
-    "stop_atr_multiple": 1.0,
-    "tp_atr_multiple": 999.0,
     "fh_percentile": 75.0,
     "gap_threshold_pct": 0.10,
     "fh_dead_zone_lo": 0.50,
@@ -91,13 +89,14 @@ SEED = 42
 
 def run_one(signals_base, risk, tp_mult):
     signals = signals_base.copy()
-    sig_mask = signals["signal"] != 0
-    if sig_mask.any():
-        signals.loc[sig_mask, "tp_price"] = (
-            signals.loc[sig_mask, "close"] + signals.loc[sig_mask, "atr"] * tp_mult
-        )
 
-    result = run_backtest(signals, **{**BACKTEST_BASE, "risk_per_trade": risk})
+    bt_cfg = {
+        **BACKTEST_BASE,
+        "risk_per_trade": risk,
+        "stop_atr_multiple": 1.0,
+        "tp_atr_multiple": tp_mult if tp_mult < 900 else 0.0,
+    }
+    result = run_backtest(signals, **bt_cfg)
     metrics = compute_metrics(result, initial_capital=BACKTEST_BASE["initial_capital"])
 
     tp = simulate_prop_firm_2phase(

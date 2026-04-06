@@ -70,6 +70,9 @@ BASE_STRATEGY_CONFIG = {
     "holding_bars": 8,
 }
 
+# Parameters that belong to backtester (not strategy)
+BACKTEST_GRID_KEYS = {"stop_atr_multiple", "tp_atr_multiple"}
+
 PARAM_GRID = {
     "stop_atr_multiple": [1.0, 1.5, 2.0],
     "tp_atr_multiple": [1.5, 2.0, 3.0],
@@ -133,9 +136,12 @@ def _grid_search(
     for combo in itertools.product(*values):
         params = dict(zip(keys, combo))
         try:
-            merged_params = {**BASE_STRATEGY_CONFIG, **params}
+            # Split params: backtest-level (stop/TP) vs strategy-level
+            bt_overrides = {k: v for k, v in params.items() if k in BACKTEST_GRID_KEYS}
+            strat_overrides = {k: v for k, v in params.items() if k not in BACKTEST_GRID_KEYS}
+            merged_params = {**BASE_STRATEGY_CONFIG, **strat_overrides}
             signals = strategy_module.generate_signals(df.copy(), **merged_params)
-            result = run_backtest(signals, **backtest_config)
+            result = run_backtest(signals, **{**backtest_config, **bt_overrides})
             metrics = compute_metrics(result, initial_capital=backtest_config["initial_capital"])
             sharpe = metrics["mtm"]["sharpe"]
             if sharpe > best_sharpe:

@@ -421,7 +421,6 @@ def generate_signals(
     df: pd.DataFrame,
     rules: list[StrategyRule],
     atr_period: int = 14,
-    tp_atr_multiple: float = 1.5,
     session_start: str = "09:30",
     session_end: str = "16:00",
     max_trades_per_day: int = 3,
@@ -430,7 +429,8 @@ def generate_signals(
     """Generate combined signals from a list of edge-derived rules.
 
     This is the backtester-compatible interface matching the contract:
-        generate_signals(df, **params) -> DataFrame with signal, stop_price columns.
+        generate_signals(df, **params) -> DataFrame with signal, atr columns.
+    Stop/TP are computed by the backtester at fill time.
 
     Parameters
     ----------
@@ -440,8 +440,6 @@ def generate_signals(
         Rules from edges_to_rules().
     atr_period : int
         ATR lookback period.
-    tp_atr_multiple : float
-        ATR multiplier for take-profit.
     session_start, session_end : str
         Session boundaries in HH:MM.
     max_trades_per_day : int
@@ -450,7 +448,7 @@ def generate_signals(
     Returns
     -------
     pd.DataFrame
-        DataFrame with signal, stop_price, tp_price, session_close columns.
+        DataFrame with signal, atr, session_close columns.
     """
     out = _add_derived_columns(df, atr_period=atr_period)
 
@@ -493,22 +491,6 @@ def generate_signals(
 
     out["signal"] = combined
     out["rule_source"] = rule_source
-
-    # Stop price: ATR-based stop (1x ATR from entry)
-    atr_vals = out["atr"].values
-    stop_price = np.full(n, np.nan)
-    long_mask = combined == 1
-    short_mask = combined == -1
-    close_vals = out["close"].values
-    stop_price[long_mask] = close_vals[long_mask] - atr_vals[long_mask]
-    stop_price[short_mask] = close_vals[short_mask] + atr_vals[short_mask]
-    out["stop_price"] = stop_price
-
-    # Take-profit: ATR-based
-    tp_price = np.full(n, np.nan)
-    tp_price[long_mask] = close_vals[long_mask] + atr_vals[long_mask] * tp_atr_multiple
-    tp_price[short_mask] = close_vals[short_mask] - atr_vals[short_mask] * tp_atr_multiple
-    out["tp_price"] = tp_price
 
     # Session close marker
     bar_mins = out["mins_since_midnight"]

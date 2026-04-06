@@ -45,6 +45,8 @@ BACKTEST_BASE = {
     "consec_loss_threshold": 0,
     "loss_scale_down": 1.0,
     "max_risk_per_trade": 0.0,
+    "stop_atr_multiple": 1.0,
+    "tp_atr_multiple": 2.0,        # locked 2R TP
 }
 
 PHASE1 = {
@@ -76,8 +78,6 @@ BASE_STRAT = {
     "fh_end": "10:30",
     "entry_cutoff": "15:45",
     "atr_period": 14,
-    "stop_atr_multiple": 1.0,
-    "tp_atr_multiple": 2.0,        # locked 2R TP
     "trend_20d_max": 999.0,
     "vol_filter": False,
 }

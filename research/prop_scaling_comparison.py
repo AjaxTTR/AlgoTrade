@@ -49,6 +49,8 @@ BASE_BACKTEST = {
     "min_bars_between_entries": 2,
     "consec_loss_threshold": 2,
     "loss_scale_down": 0.5,
+    "stop_atr_multiple": 1.5,
+    "tp_atr_multiple": 2.0,
 }
 
 BASE_STRATEGY = {
@@ -58,8 +60,6 @@ BASE_STRATEGY = {
     "entry_cutoff": "15:45",
     "fh_percentile": 80.0,
     "atr_period": 14,
-    "stop_atr_multiple": 1.5,
-    "tp_atr_multiple": 2.0,
     "holding_bars": 8,
     "max_trades_per_day": 4,
     "pullback_atr_frac": 1.0,
@@ -114,9 +114,6 @@ def _filter_tiers(signals, tiers):
     out = signals.copy()
     mask = (out["signal"] != 0) & (~out["signal_tier"].isin(tiers))
     out.loc[mask, "signal"] = 0
-    out.loc[mask, "stop_price"] = np.nan
-    out.loc[mask, "tp_price"] = np.nan
-    out.loc[mask, "size_factor"] = 1.0
     out.loc[mask, "signal_tier"] = 0
     return out
 

@@ -44,6 +44,8 @@ BACKTEST_CONFIG = {
     "point_value": 20.0,            # NQ futures: $20 per point
     "commission_per_side": 2.0,     # per contract per side
     "slippage_points": 0.25,        # adverse points per fill
+    "stop_atr_multiple": 1.5,      # stop = ATR * 1.5 below entry
+    "tp_atr_multiple": 2.0,        # TP = ATR * 2.0 above entry
     "use_trailing_stop": False,     # disable for simpler day trading
     "daily_dd_limit": 0.02,         # 2% daily drawdown limit — stop trading
     "max_daily_risk": 0.02,         # block new entries if daily risk >= 2%
@@ -62,8 +64,6 @@ STRATEGY_CONFIG = {
     "fh_end": "10:30",
     "entry_cutoff": "15:45",
     "atr_period": 14,
-    "stop_atr_multiple": 1.5,
-    "tp_atr_multiple": 2.0,
     "fh_percentile": 80.0,
     "atr_percentile_min": 60.0,
 }

@@ -34,8 +34,6 @@ def generate_signals(
     entry_cutoff: str = "15:45",
     fh_threshold: float = 0.0,
     atr_period: int = 14,
-    stop_atr_multiple: float = 1.5,
-    tp_atr_multiple: float = 2.0,
     fh_percentile: float = 80.0,
     atr_percentile_min: float = 60.0,
     **kwargs,
@@ -58,10 +56,6 @@ def generate_signals(
         Hard minimum floor for early_return (default 0.0).
     atr_period : int
         Lookback for Average True Range (default 14).
-    stop_atr_multiple : float
-        Stop distance as ATR multiple (default 1.5).
-    tp_atr_multiple : float
-        Take-profit distance as ATR multiple (default 2.0).
     fh_percentile : float
         Percentile of early_return distribution used as dynamic threshold
         (default 80.0 = only top 20% qualify). No lookahead.
@@ -71,9 +65,9 @@ def generate_signals(
     Returns
     -------
     pd.DataFrame
-        Copy of input with added columns: signal, stop_price, tp_price,
-        session_close, atr, fh_return, size_factor, signal_tier,
-        entry_type, early_return_threshold, is_top_percentile,
+        Copy of input with added columns: signal, signal_tier,
+        entry_type, session_close, atr, fh_return,
+        early_return_threshold, is_top_percentile,
         fh_rank_percentile, atr_percentile, is_high_vol.
     """
     out = build_features(
@@ -134,32 +128,17 @@ def generate_signals(
 
     # -- Signal output columns --
     out["signal"] = 0
-    out["stop_price"] = np.nan
-    out["tp_price"] = np.nan
-    out["size_factor"] = 1.0
     out["signal_tier"] = 0
     out["entry_type"] = ""
 
     sig_col = out.columns.get_loc("signal")
-    stop_col = out.columns.get_loc("stop_price")
-    tp_col = out.columns.get_loc("tp_price")
-    sf_col = out.columns.get_loc("size_factor")
     tier_col = out.columns.get_loc("signal_tier")
     et_col = out.columns.get_loc("entry_type")
 
-    closes = out["close"].values
-    atrs = out["atr"].values
     dates = out["date"].values
 
     def _place_long(idx):
-        atr_val = atrs[idx]
-        if pd.isna(atr_val) or atr_val <= 0:
-            return False
-        px = closes[idx]
         out.iloc[idx, sig_col] = 1
-        out.iloc[idx, stop_col] = px - atr_val * stop_atr_multiple
-        out.iloc[idx, tp_col] = px + atr_val * tp_atr_multiple
-        out.iloc[idx, sf_col] = 1.0
         out.iloc[idx, tier_col] = 1
         out.iloc[idx, et_col] = "early"
         return True
@@ -186,9 +165,6 @@ def generate_signals(
         raise ValueError(f"signal contains invalid values: {invalid_vals}. Expected {{0, 1}}.")
     if signal_bars["signal"].isna().any():
         raise ValueError("signal column contains NaN on signal bars.")
-    if signal_bars["stop_price"].isna().any():
-        bad = signal_bars[signal_bars["stop_price"].isna()].index.tolist()
-        raise ValueError(f"stop_price is NaN on {len(bad)} signal bar(s): {bad[:5]}")
     signals_per_day = signal_bars.groupby(signal_bars.index.date).size()
     multi = signals_per_day[signals_per_day > 1]
     if len(multi) > 0:

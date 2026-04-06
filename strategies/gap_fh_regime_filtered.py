@@ -13,7 +13,6 @@ Every strategy module must expose:
     def generate_signals(df: pd.DataFrame, **params) -> pd.DataFrame
 """
 
-import numpy as np
 import pandas as pd
 
 from strategies.gap_fh_continuation import generate_signals as _base_generate_signals
@@ -98,9 +97,6 @@ def generate_signals(
         skip_idx = skip[skip].index
 
         out.loc[skip_idx, "signal"] = 0
-        out.loc[skip_idx, "stop_price"] = np.nan
-        out.loc[skip_idx, "tp_price"] = np.nan
-        out.loc[skip_idx, "size_factor"] = 1.0
         out.loc[skip_idx, "signal_tier"] = 0
         out.loc[skip_idx, "entry_type"] = ""
 

@@ -38,8 +38,6 @@ STRATEGY_PARAMS = {
     "fh_end": "10:30",
     "entry_cutoff": "15:45",
     "atr_period": 14,
-    "stop_atr_multiple": 1.0,       # 1.0x ATR stop (Variant B)
-    "tp_atr_multiple": 999.0,       # placeholder, overridden per experiment
     "fh_percentile": 75.0,          # 75th percentile (Variant B)
     "gap_threshold_pct": 0.10,
     "fh_dead_zone_lo": 0.50,        # dead zone ON
@@ -99,18 +97,15 @@ SEED = 42
 def run_experiment(signals_cache, risk, tp_mult):
     """Run one backtest + prop firm simulation for a (risk, tp) combo."""
 
-    # Override TP in signals (modify tp_price column)
     signals = signals_cache.copy()
-    if tp_mult < 900:
-        # Recompute tp_price from entry price + tp_mult * ATR
-        sig_mask = signals["signal"] != 0
-        if sig_mask.any():
-            signals.loc[sig_mask, "tp_price"] = (
-                signals.loc[sig_mask, "close"] + signals.loc[sig_mask, "atr"] * tp_mult
-            )
 
-    # Backtest config
-    bt_cfg = {**BACKTEST_BASE, "risk_per_trade": risk}
+    # Backtest config — stop/TP computed by backtester from ATR
+    bt_cfg = {
+        **BACKTEST_BASE,
+        "risk_per_trade": risk,
+        "stop_atr_multiple": 1.0,
+        "tp_atr_multiple": tp_mult if tp_mult < 900 else 0.0,
+    }
     result = run_backtest(signals, **bt_cfg)
 
     # Metrics
@@ -179,9 +174,7 @@ def main():
     import importlib
     strategy = importlib.import_module(STRATEGY_MODULE)
 
-    # Use high TP for base signals (will be overridden per experiment)
-    sig_params = {**STRATEGY_PARAMS, "tp_atr_multiple": 999.0}
-    signals = strategy.generate_signals(df, **sig_params)
+    signals = strategy.generate_signals(df, **STRATEGY_PARAMS)
     n_signals = int((signals["signal"] != 0).sum())
     print(f"  Generated {n_signals} entry signals")
 

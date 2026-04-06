@@ -63,6 +63,9 @@ BASE_STRATEGY_CONFIG = {
     "enable_short": True,
 }
 
+# Parameters that belong to backtester (not strategy)
+BACKTEST_GRID_KEYS = {"stop_atr_multiple", "tp_atr_multiple"}
+
 PARAM_GRID = {
     "stop_atr_multiple": [1.0, 1.5, 2.0],
     "tp_atr_multiple": [1.5, 2.0, 3.0],
@@ -144,9 +147,12 @@ def _evaluate_combo(args: tuple) -> dict:
     try:
         df = load_csv(data_file)
         strategy_module = importlib.import_module(f"strategies.{strategy_name}")
-        merged_params = {**BASE_STRATEGY_CONFIG, **params}
+        # Split params: backtest-level (stop/TP) vs strategy-level
+        bt_overrides = {k: v for k, v in params.items() if k in BACKTEST_GRID_KEYS}
+        strat_overrides = {k: v for k, v in params.items() if k not in BACKTEST_GRID_KEYS}
+        merged_params = {**BASE_STRATEGY_CONFIG, **strat_overrides}
         signals = strategy_module.generate_signals(df.copy(), **merged_params)
-        bt_result = run(signals, **BACKTEST_CONFIG)
+        bt_result = run(signals, **{**BACKTEST_CONFIG, **bt_overrides})
         metrics = compute_metrics(bt_result, initial_capital=BACKTEST_CONFIG["initial_capital"])
 
         mtm = metrics["mtm"]

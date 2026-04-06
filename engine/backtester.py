@@ -35,6 +35,7 @@ class TradeRecord:
     mfe: float = 0.0       # max favourable excursion (points, always >= 0)
     mae_mfe_ratio: float = 0.0  # MAE / MFE (lower = cleaner trade)
     stop_distance: float = 0.0  # initial stop distance in points
+    strategy_name: str = ""     # source strategy (for portfolio tracking)
 
 
 @dataclass
@@ -53,6 +54,7 @@ class _Position:
     mfe: float = 0.0
     stop_distance: float = 0.0
     prev_mtm: float = 0.0
+    strategy_name: str = ""
 
 
 @dataclass
@@ -78,6 +80,8 @@ def run(
     commission_per_side: float = 2.0,
     slippage_points: float = 0.0,
     spread_points: float = 0.25,
+    stop_atr_multiple: float = 1.0,
+    tp_atr_multiple: float = 0.0,
     use_trailing_stop: bool = False,
     trail_atr_multiple: float = 2.0,
     partial_tp_pct: float = 0.5,
@@ -97,6 +101,7 @@ def run(
     consec_loss_threshold: int = 2,
     loss_scale_down: float = 0.5,
     max_risk_per_trade: float = 0.006,
+    strategy_name: str = "",
     **kwargs,
 ) -> BacktestResult:
     """Execute a backtest over a signal DataFrame.
@@ -104,6 +109,8 @@ def run(
     Execution model
     ---------------
     - Signals fire on bar *i*; entry fills at bar *i+execution_delay_bars* open.
+    - Stops and take-profits are computed by the backtester at fill time
+      using ATR and configurable multiples (stop_atr_multiple, tp_atr_multiple).
     - Stop-loss is checked first each bar (priority over take-profit).
     - Take-profit is checked only if the stop was not hit.
     - Stop fills at the worse of target price or bar open (gap model).
@@ -123,8 +130,8 @@ def run(
     Parameters
     ----------
     signals : pd.DataFrame
-        Must contain columns: open, high, low, close, signal, stop_price.
-        Optionally contains: tp_price, session_close, atr, signal_tier.
+        Must contain columns: open, high, low, close, signal, atr.
+        Optionally contains: session_close, signal_tier, size_factor.
     initial_capital : float
         Starting account equity in USD.
     risk_per_trade : float
@@ -138,6 +145,13 @@ def run(
     spread_points : float
         Bid-ask spread in points (default 0.25 for NQ). Half-spread is
         applied adversely on every fill.
+    stop_atr_multiple : float
+        Stop distance as multiple of ATR at fill time (default 1.0).
+        For longs: stop = fill_price - ATR * multiple.
+    tp_atr_multiple : float
+        Take-profit distance as multiple of ATR at fill time (default 0.0).
+        0.0 disables TP (exit via session close or time exit).
+        For longs: tp = fill_price + ATR * multiple.
     use_trailing_stop : bool
         Enable partial TP at target + ATR trailing stop on remainder.
     trail_atr_multiple : float
@@ -188,13 +202,15 @@ def run(
     lows = signals["low"].values
     opens = signals["open"].values
     sigs = signals["signal"].values.astype(np.int8)
-    stops = signals["stop_price"].values
+
+    # ATR is required for stop/TP computation
+    if "atr" not in signals.columns:
+        raise ValueError("signals DataFrame must contain an 'atr' column for stop/TP computation")
+    atrs = signals["atr"].values
+    has_atr = True
 
     # Optional columns
-    tps = signals["tp_price"].values if "tp_price" in signals.columns else np.full(len(closes), np.nan)
     session_closes = signals["session_close"].values if "session_close" in signals.columns else np.zeros(len(closes), dtype=bool)
-    has_atr = "atr" in signals.columns
-    atrs = signals["atr"].values if has_atr else np.full(len(closes), np.nan)
     size_factors = signals["size_factor"].values if "size_factor" in signals.columns else np.ones(len(closes), dtype=np.float64)
     signal_tiers = signals["signal_tier"].values if "signal_tier" in signals.columns else np.zeros(len(closes), dtype=int)
 
@@ -227,8 +243,6 @@ def run(
 
     # Pending entry: signal queued with a target fill bar
     pending_signal = 0
-    pending_stop = np.nan
-    pending_tp = np.nan
     pending_fill_bar = -1
     pending_size_factor = 1.0
     pending_tier = 999  # lower = higher priority
@@ -256,11 +270,9 @@ def run(
     trades: list[TradeRecord] = []
 
     def _clear_pending():
-        nonlocal pending_signal, pending_stop, pending_tp
+        nonlocal pending_signal
         nonlocal pending_fill_bar, pending_size_factor, pending_tier
         pending_signal = 0
-        pending_stop = np.nan
-        pending_tp = np.nan
         pending_fill_bar = -1
         pending_size_factor = 1.0
         pending_tier = 999
@@ -304,6 +316,7 @@ def run(
             mfe=pos.mfe,
             mae_mfe_ratio=round(mae_mfe_ratio, 4),
             stop_distance=pos.stop_distance,
+            strategy_name=pos.strategy_name,
         ))
         return net_pnl
 
@@ -491,11 +504,27 @@ def run(
 
             else:
                 sig = pending_signal
-                stop_val = pending_stop
-                tp_val = pending_tp
                 sfactor = pending_size_factor
 
                 fill_price = opens[i] + market_cost if sig == 1 else opens[i] - market_cost
+
+                # Compute stop and TP from ATR at fill time
+                atr_at_fill = atrs[i]
+                if not np.isnan(atr_at_fill) and atr_at_fill > 0 and stop_atr_multiple > 0:
+                    if sig == 1:
+                        stop_val = fill_price - atr_at_fill * stop_atr_multiple
+                    else:
+                        stop_val = fill_price + atr_at_fill * stop_atr_multiple
+                else:
+                    stop_val = np.nan
+
+                if tp_atr_multiple > 0 and not np.isnan(atr_at_fill) and atr_at_fill > 0:
+                    if sig == 1:
+                        tp_val = fill_price + atr_at_fill * tp_atr_multiple
+                    else:
+                        tp_val = fill_price - atr_at_fill * tp_atr_multiple
+                else:
+                    tp_val = np.nan
 
                 # Max daily risk gate
                 skip_entry = False
@@ -570,6 +599,7 @@ def run(
                             entry_idx=i,
                             original_size=contracts,
                             stop_distance=abs(entry_px - stop_val),
+                            strategy_name=strategy_name,
                         )
                         positions.append(pos)
                         last_entry_bar = i
@@ -578,8 +608,7 @@ def run(
                 _clear_pending()
 
         # ── 4. Register new signal (tier priority) ──
-        if (sigs[i] != 0 and not np.isnan(stops[i])
-                and not halted and not daily_halted):
+        if (sigs[i] != 0 and not halted and not daily_halted):
             effective_count = len(positions) + (1 if pending_signal != 0 else 0)
             if effective_count < max_concurrent_trades:
                 fill_bar = i + execution_delay_bars
@@ -589,15 +618,11 @@ def run(
                         # Replace only if new signal has higher priority (lower tier)
                         if new_tier < pending_tier:
                             pending_signal = sigs[i]
-                            pending_stop = stops[i]
-                            pending_tp = tps[i]
                             pending_fill_bar = fill_bar
                             pending_size_factor = size_factors[i]
                             pending_tier = new_tier
                     else:
                         pending_signal = sigs[i]
-                        pending_stop = stops[i]
-                        pending_tp = tps[i]
                         pending_fill_bar = fill_bar
                         pending_size_factor = size_factors[i]
                         pending_tier = new_tier
@@ -648,6 +673,7 @@ def run(
             mfe=pos.mfe,
             mae_mfe_ratio=round(mae_mfe_ratio, 4),
             stop_distance=pos.stop_distance,
+            strategy_name=pos.strategy_name,
         ))
     equity_closed[-1] = closed_equity
 
