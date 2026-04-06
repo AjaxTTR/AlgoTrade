@@ -1,14 +1,12 @@
 """
-Gap-Up First-Hour Continuation strategy (long only).
+Combined First-Hour system (long only).
 
-Validated edge: Gap Up + FH return >= 75th percentile -> continuation.
+Merges two validated edges into one strategy:
+  A. Gap-Up Continuation -- gap > +0.10%, FH return >= percentile threshold
+  B. No-Gap FH Breakout  -- |gap| <= 0.10%, FH return >= percentile threshold
 
-Trade logic:
-  1. Gap-up filter: session open > prior day close by >= gap_threshold_pct.
-  2. First-hour return (09:30-10:30): expanding percentile from prior days.
-  3. Signal fires when gap_up AND fh_return >= dynamic threshold.
-  4. Enter long at 10:30 bar close.
-  5. At most 1 trade per day. Long only.
+Priority: gap-up checked first; no-gap only if gap-up doesn't fire.
+Max 1 trade per day. EOD exit (or stop/TP).
 
 Every strategy module must expose:
     def generate_signals(df: pd.DataFrame, **params) -> pd.DataFrame
@@ -31,9 +29,10 @@ def generate_signals(
     tp_atr_multiple: float = 1.0,
     fh_percentile: float = 75.0,
     gap_threshold_pct: float = 0.10,
+    max_bars_in_trade: int = 999,
     **kwargs,
 ) -> pd.DataFrame:
-    """Generate long-only gap-up first-hour continuation signals."""
+    """Generate signals from combined gap-up continuation + no-gap breakout."""
     out = build_features(
         df, session_start=session_start, session_end=session_end,
         fh_end=fh_end, entry_cutoff=entry_cutoff, atr_period=atr_period,
@@ -44,31 +43,36 @@ def generate_signals(
     t_session_end = pd.Timestamp(session_end).time()
     t_entry_cutoff = pd.Timestamp(entry_cutoff).time()
 
-    # -- FH percentile threshold (no lookahead) --
+    # -- FH percentile threshold --
     fh_daily = out.groupby("date")["fh_return"].first().dropna()
     dynamic_thresh = compute_fh_threshold(fh_daily, fh_percentile)
 
-    # -- Classify qualifying days --
-    signal_days = set()
+    # -- Classify days: gap-up continuation OR no-gap breakout --
+    signal_days = {}  # date -> entry_type
     sorted_dates = sorted(fh_daily.index)
 
     for i, d in enumerate(sorted_dates):
         if i == 0:
             continue
 
-        gap = out.loc[out["date"] == d, "gap_pct"].iloc[0]
-        if pd.isna(gap) or gap <= gap_threshold_pct:
-            continue
-
+        # FH threshold check (same for both signals)
         thresh = dynamic_thresh.get(d, np.nan)
         if pd.isna(thresh):
             continue
-
         fh_ret = fh_daily.get(d, np.nan)
         if pd.isna(fh_ret) or fh_ret < thresh:
             continue
 
-        signal_days.add(d)
+        gap = out.loc[out["date"] == d, "gap_pct"].iloc[0]
+        if pd.isna(gap):
+            continue
+
+        # Priority A: gap-up continuation
+        if gap > gap_threshold_pct:
+            signal_days[d] = "gap_up_continuation"
+        # Priority B: no-gap breakout
+        elif abs(gap) <= gap_threshold_pct:
+            signal_days[d] = "no_gap_breakout"
 
     # -- Signal output columns --
     out["signal"] = 0
@@ -89,7 +93,7 @@ def generate_signals(
     atrs = out["atr"].values
     dates = out["date"].values
 
-    def _place_long(idx):
+    def _place_long(idx, entry_type, tier):
         atr_val = atrs[idx]
         if pd.isna(atr_val) or atr_val <= 0:
             return False
@@ -98,21 +102,24 @@ def generate_signals(
         out.iloc[idx, stop_col] = px - atr_val * stop_atr_multiple
         out.iloc[idx, tp_col] = px + atr_val * tp_atr_multiple
         out.iloc[idx, sf_col] = 1.0
-        out.iloc[idx, tier_col] = 1
-        out.iloc[idx, et_col] = "gap_fh_continuation"
+        out.iloc[idx, tier_col] = tier
+        out.iloc[idx, et_col] = entry_type
         return True
 
     date_bar_ranges = get_date_bar_ranges(dates, n)
 
-    for d in sorted(signal_days):
+    for d in sorted(signal_days.keys()):
         if d not in date_bar_ranges:
             continue
         d_start, d_end = date_bar_ranges[d]
 
+        entry_type = signal_days[d]
+        tier = 1 if entry_type == "gap_up_continuation" else 2
+
         for i in range(d_start, d_end):
             t = time_vals[i]
             if t >= t_fh_end and t < t_entry_cutoff and t < t_session_end:
-                _place_long(i)
+                _place_long(i, entry_type, tier)
                 break
 
     out.drop(columns=["date"], inplace=True)

@@ -1,12 +1,12 @@
 """
-Gap-Up First-Hour Continuation strategy (long only).
+No-Gap First-Hour Breakout strategy (long only).
 
-Validated edge: Gap Up + FH return >= 75th percentile -> continuation.
+Edge: No significant gap + strong FH return -> continuation.
 
 Trade logic:
-  1. Gap-up filter: session open > prior day close by >= gap_threshold_pct.
+  1. No-gap filter: |gap| <= gap_threshold_pct.
   2. First-hour return (09:30-10:30): expanding percentile from prior days.
-  3. Signal fires when gap_up AND fh_return >= dynamic threshold.
+  3. Signal fires when no_gap AND fh_return >= dynamic threshold.
   4. Enter long at 10:30 bar close.
   5. At most 1 trade per day. Long only.
 
@@ -33,7 +33,7 @@ def generate_signals(
     gap_threshold_pct: float = 0.10,
     **kwargs,
 ) -> pd.DataFrame:
-    """Generate long-only gap-up first-hour continuation signals."""
+    """Generate long-only no-gap first-hour breakout signals."""
     out = build_features(
         df, session_start=session_start, session_end=session_end,
         fh_end=fh_end, entry_cutoff=entry_cutoff, atr_period=atr_period,
@@ -44,11 +44,11 @@ def generate_signals(
     t_session_end = pd.Timestamp(session_end).time()
     t_entry_cutoff = pd.Timestamp(entry_cutoff).time()
 
-    # -- FH percentile threshold (no lookahead) --
+    # -- FH percentile threshold --
     fh_daily = out.groupby("date")["fh_return"].first().dropna()
     dynamic_thresh = compute_fh_threshold(fh_daily, fh_percentile)
 
-    # -- Classify qualifying days --
+    # -- Classify qualifying days: no-gap + strong FH --
     signal_days = set()
     sorted_dates = sorted(fh_daily.index)
 
@@ -57,7 +57,7 @@ def generate_signals(
             continue
 
         gap = out.loc[out["date"] == d, "gap_pct"].iloc[0]
-        if pd.isna(gap) or gap <= gap_threshold_pct:
+        if pd.isna(gap) or abs(gap) > gap_threshold_pct:
             continue
 
         thresh = dynamic_thresh.get(d, np.nan)
@@ -99,7 +99,7 @@ def generate_signals(
         out.iloc[idx, tp_col] = px + atr_val * tp_atr_multiple
         out.iloc[idx, sf_col] = 1.0
         out.iloc[idx, tier_col] = 1
-        out.iloc[idx, et_col] = "gap_fh_continuation"
+        out.iloc[idx, et_col] = "no_gap_breakout"
         return True
 
     date_bar_ranges = get_date_bar_ranges(dates, n)
