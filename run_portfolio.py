@@ -146,8 +146,8 @@ BASE_BACKTEST_CONFIG = {
 
 DEFAULT_PORTFOLIO_CONFIG = {
     "strategies": {
-        "gap_momentum": {"weight": 0.60, "risk_per_trade": 0.008},
-        "regime_filtered_momentum": {"weight": 0.40, "risk_per_trade": 0.006},
+        "gap_momentum": {"weight": 0.60, "risk_per_trade": 0.014},
+        "regime_filtered_momentum": {"weight": 0.40, "risk_per_trade": 0.014},
     },
 }
 
