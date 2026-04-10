@@ -284,8 +284,12 @@ def run(
         gross_pnl = pos.direction * (fill_px - pos.entry_price) * size * point_value
         exit_comm = commission_per_side * size
         net_pnl = gross_pnl - exit_comm
+        # When a position closes we must REMOVE the previously-marked
+        # unrealized P&L (mtm_share) from equity_mtm and ADD the now-realized
+        # net_pnl. The previous code added mtm_share with the wrong sign,
+        # which inflated equity_mtm by 2 * prev_mtm on every exit.
         mtm_share = pos.prev_mtm * (size / pos.size) if pos.size > 0 else 0.0
-        bar_cash_flow += net_pnl + mtm_share
+        bar_cash_flow += net_pnl - mtm_share
         closed_equity += net_pnl
         if net_pnl < 0:
             day_realized_loss += abs(net_pnl)
@@ -508,8 +512,11 @@ def run(
 
                 fill_price = opens[i] + market_cost if sig == 1 else opens[i] - market_cost
 
-                # Compute stop and TP from ATR at fill time
-                atr_at_fill = atrs[i]
+                # Compute stop and TP from ATR at fill time.
+                # Use atrs[i-1] (prior bar's ATR) — atrs[i] would include
+                # bar i's high/low/close, which a real-time trader does not
+                # know at the open of bar i. Using atrs[i] is lookahead.
+                atr_at_fill = atrs[i - 1]
                 if not np.isnan(atr_at_fill) and atr_at_fill > 0 and stop_atr_multiple > 0:
                     if sig == 1:
                         stop_val = fill_price - atr_at_fill * stop_atr_multiple
@@ -544,9 +551,11 @@ def run(
                     risk_amount = equity_mtm[i - 1] * risk_per_trade * sfactor * size_scale
                     contracts = 0
 
-                    # Volatility-normalised sizing
-                    if use_volatility_sizing and has_atr and not np.isnan(atrs[i]) and atrs[i] > 0:
-                        risk_per_contract = atrs[i] * point_value
+                    # Volatility-normalised sizing.
+                    # Use atr_at_fill (= atrs[i-1]) — same lookahead reason
+                    # as the stop/TP computation above.
+                    if use_volatility_sizing and has_atr and not np.isnan(atr_at_fill) and atr_at_fill > 0:
+                        risk_per_contract = atr_at_fill * point_value
                         contracts = max(1, math.floor(risk_amount / risk_per_contract))
                     else:
                         # Fallback: stop-distance sizing
@@ -565,7 +574,7 @@ def run(
                                 "Bar %d: risk gate — actual=$%.0f > max=$%.0f "
                                 "(stop_dist=%.1f, ATR=%.1f), skipping",
                                 i, actual_risk, max_allowed,
-                                stop_dist_actual, atrs[i] if has_atr else 0,
+                                stop_dist_actual, atr_at_fill if has_atr else 0,
                             )
                             contracts = 0
                             risk_skipped_count += 1
