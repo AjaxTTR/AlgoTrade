@@ -101,6 +101,9 @@ def run(
     consec_loss_threshold: int = 2,
     loss_scale_down: float = 0.5,
     max_risk_per_trade: float = 0.006,
+    respect_session_close: bool = True,
+    sizing_mode: str = "compounding",
+    fixed_contracts: int = 1,
     strategy_name: str = "",
     **kwargs,
 ) -> BacktestResult:
@@ -192,6 +195,26 @@ def run(
         Multiplier applied to risk_per_trade after consec_loss_threshold
         consecutive losses (default 0.5 = halve size).  Resets to 1.0
         after the next winning trade.
+    respect_session_close : bool
+        If True (default = Deployment Mode), exit positions on the
+        session_close column. If False (Edge Mode), ignore the column
+        and let trades run to TP/SL/final-bar. Used to measure whether
+        the RTH 16:00 boundary is an empirical edge boundary or an
+        assumed one (Priority 0.9 cross-RTH decay test).
+    sizing_mode : str
+        Position sizing regime. One of:
+          - "compounding" (default = Deployment Mode): ATR-volatility
+            sizing scaled by equity_mtm[i-1] * risk_per_trade * sfactor
+            * size_scale. Every trade's dollar P&L depends on prior
+            outcomes, so edge is measured in equity-space.
+          - "fixed_contract" (Edge Mode): always trade `fixed_contracts`
+            regardless of equity, sfactor, consec-loss state, or ATR.
+            Bypasses the compounding feedback loop so edge can be
+            measured in point-space (per-trade returns, independent of
+            path).
+    fixed_contracts : int
+        Number of contracts per trade when sizing_mode="fixed_contract"
+        (default 1). Ignored under "compounding".
 
     Returns
     -------
@@ -202,6 +225,15 @@ def run(
     lows = signals["low"].values
     opens = signals["open"].values
     sigs = signals["signal"].values.astype(np.int8)
+
+    # Validate sizing_mode — fail loudly if a caller passes something
+    # unrecognised (safer than silently falling back to compounding).
+    if sizing_mode not in ("compounding", "fixed_contract"):
+        raise ValueError(
+            f"sizing_mode must be 'compounding' or 'fixed_contract', got {sizing_mode!r}"
+        )
+    if sizing_mode == "fixed_contract" and fixed_contracts < 1:
+        raise ValueError(f"fixed_contracts must be >= 1, got {fixed_contracts}")
 
     # ATR is required for stop/TP computation
     if "atr" not in signals.columns:
@@ -476,8 +508,10 @@ def run(
                     exited = True
                     exit_reason = "time_exit"
 
-            # Session close exit
-            if not exited and session_closes[i]:
+            # Session close exit. Gated on respect_session_close so Edge Mode
+            # can let trades run past the RTH boundary (the 16:00 convention
+            # is not the contract's actual close — NQ trades to ~17:00 ET).
+            if not exited and respect_session_close and session_closes[i]:
                 fill_price = closes[i]
                 if pos.direction == 1:
                     fill_price -= market_cost
@@ -548,20 +582,30 @@ def run(
                         skip_entry = True
 
                 if not skip_entry:
-                    risk_amount = equity_mtm[i - 1] * risk_per_trade * sfactor * size_scale
                     contracts = 0
 
-                    # Volatility-normalised sizing.
-                    # Use atr_at_fill (= atrs[i-1]) — same lookahead reason
-                    # as the stop/TP computation above.
-                    if use_volatility_sizing and has_atr and not np.isnan(atr_at_fill) and atr_at_fill > 0:
-                        risk_per_contract = atr_at_fill * point_value
-                        contracts = max(1, math.floor(risk_amount / risk_per_contract))
+                    if sizing_mode == "fixed_contract":
+                        # Edge Mode path: always N contracts, independent of
+                        # equity, sfactor, consec-loss state, and ATR. Removes
+                        # the path-dependency that contaminates equity-space
+                        # edge measurement.
+                        contracts = fixed_contracts
                     else:
-                        # Fallback: stop-distance sizing
-                        stop_dist = abs(fill_price - stop_val)
-                        if stop_dist > 0:
-                            contracts = max(1, math.floor(risk_amount / (stop_dist * point_value)))
+                        # Deployment Mode path: ATR-volatility sizing scaled by
+                        # equity_mtm[i-1] * risk_per_trade * sfactor * size_scale.
+                        risk_amount = equity_mtm[i - 1] * risk_per_trade * sfactor * size_scale
+
+                        # Volatility-normalised sizing.
+                        # Use atr_at_fill (= atrs[i-1]) — same lookahead reason
+                        # as the stop/TP computation above.
+                        if use_volatility_sizing and has_atr and not np.isnan(atr_at_fill) and atr_at_fill > 0:
+                            risk_per_contract = atr_at_fill * point_value
+                            contracts = max(1, math.floor(risk_amount / risk_per_contract))
+                        else:
+                            # Fallback: stop-distance sizing
+                            stop_dist = abs(fill_price - stop_val)
+                            if stop_dist > 0:
+                                contracts = max(1, math.floor(risk_amount / (stop_dist * point_value)))
 
                     # Contract-level risk constraint: skip if 1-contract
                     # minimum would exceed max allowed risk per trade.
@@ -715,3 +759,55 @@ def run(
         max_concurrent_positions=max_concurrent_seen,
         risk_skipped_count=risk_skipped_count,
     )
+
+
+# =============================================================================
+# Edge Mode — measure signal quality without path-dependent contamination.
+#
+# Priority 0.7 separates two questions the default backtest conflates:
+#   (A) Does the edge exist? (signal quality)
+#   (B) Can we trade it under prop-firm rails? (deployment feasibility)
+#
+# Every halt, clip, and compounding-sizing rule in the default config biases
+# (A). Edge Mode turns those off so per-trade returns can be studied in
+# point-space instead of equity-space. Deployment Mode remains available via
+# plain `run(...)` with existing defaults.
+# =============================================================================
+
+EDGE_MODE_OVERRIDES = {
+    # --- Halts off: no path-dependent signal gating ---
+    "daily_dd_limit": 0.0,
+    "max_dd_limit": 0.0,
+    "max_daily_risk": 0.0,
+
+    # --- Clips off: let the return distribution be observed whole ---
+    "max_loss_per_trade": 0.0,
+    "max_bars_in_trade": 0,
+    "respect_session_close": False,
+
+    # --- Path-dependent sizing off: edge measured in point-space ---
+    "sizing_mode": "fixed_contract",
+    "fixed_contracts": 1,
+    "consec_loss_threshold": 999,
+
+    # --- Execution realism kept but relaxed so signals aren't silently
+    #     suppressed by defaults tuned for a 1-trade/day strategy ---
+    "max_concurrent_trades": 99,
+    "min_bars_between_entries": 1,
+}
+
+
+def run_edge_mode(signals: pd.DataFrame, **overrides) -> BacktestResult:
+    """Run a backtest in Edge Mode.
+
+    Locks every path-dependent rail (halts, clips, compounding sizing) to
+    its neutral value so per-trade returns reflect only the signal itself.
+    Caller-supplied kwargs in `overrides` win over the locked defaults —
+    useful for targeted experiments (e.g. turning `respect_session_close`
+    back on to quantify its specific contribution to measured edge).
+
+    For prop-firm pass-rate and equity-curve simulation, use `run()` with
+    the existing Deployment Mode defaults.
+    """
+    cfg = {**EDGE_MODE_OVERRIDES, **overrides}
+    return run(signals, **cfg)
