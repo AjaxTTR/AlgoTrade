@@ -7,7 +7,7 @@ Usage:
     python run_strategy.py <strategy_name>
 
 Example:
-    python run_strategy.py first_hour_momentum
+    python run_strategy.py gap_momentum
 
 The strategy name must correspond to a file in strategies/ that
 exposes a generate_signals(df, **params) function.

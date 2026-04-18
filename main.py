@@ -1,5 +1,5 @@
 """
-Main entry point for the NQ First-Hour Momentum backtesting framework.
+Main entry point for the NQ Gap-Up Momentum backtesting framework.
 
 Usage:
     python main.py
@@ -36,7 +36,7 @@ log = logging.getLogger(__name__)
 # Configuration
 # ---------------------------------------------------------------------------
 DATA_FILE = "data/nq_15m_data.csv"
-STRATEGY_NAME = "first_hour_momentum"
+STRATEGY_NAME = "gap_momentum"
 
 BACKTEST_CONFIG = {
     "initial_capital": 100_000.0,
@@ -64,8 +64,8 @@ STRATEGY_CONFIG = {
     "fh_end": "10:30",
     "entry_cutoff": "15:45",
     "atr_period": 14,
-    "fh_percentile": 80.0,
-    "atr_percentile_min": 60.0,
+    "fh_percentile": 75.0,
+    "gap_threshold_pct": 0.10,
 }
 
 PROP_FIRM_CONFIGS = {
@@ -150,7 +150,7 @@ def main() -> None:
     t_start = time.perf_counter()
 
     print("\n" + "=" * 62)
-    print("  NQ FIRST-HOUR MOMENTUM -- BACKTEST")
+    print("  NQ GAP-UP MOMENTUM -- BACKTEST")
     print("=" * 62)
 
     _print_config("Backtest Configuration", BACKTEST_CONFIG)
