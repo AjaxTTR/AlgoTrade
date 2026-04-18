@@ -585,12 +585,15 @@ def run(
 
                         entry_px = fill_price
 
-                        # Volatility-adjusted stop tightening
+                        # Volatility-adjusted stop tightening.
+                        # Use bar i-1's ATR and rolling median — reading bar i's
+                        # values here is lookahead (same bug class as the entry
+                        # stop/TP fix above). atr_at_fill == atrs[i-1].
                         if (vol_stop_tighten and atr_rolling_median is not None
-                                and not np.isnan(atrs[i]) and atrs[i] > 0
-                                and not np.isnan(atr_rolling_median[i])
-                                and atr_rolling_median[i] > 0):
-                            atr_ratio = atrs[i] / atr_rolling_median[i]
+                                and not np.isnan(atr_at_fill) and atr_at_fill > 0
+                                and not np.isnan(atr_rolling_median[i - 1])
+                                and atr_rolling_median[i - 1] > 0):
+                            atr_ratio = atr_at_fill / atr_rolling_median[i - 1]
                             if atr_ratio >= vol_stop_tighten_threshold:
                                 orig_dist = abs(fill_price - stop_val)
                                 tight_dist = orig_dist * vol_stop_tighten_factor
@@ -685,6 +688,12 @@ def run(
             strategy_name=pos.strategy_name,
         ))
     equity_closed[-1] = closed_equity
+    # After closing every remaining position, no open MTM remains — so the
+    # mark-to-market equity must equal realized closed equity at the final bar.
+    # Without this, equity_mtm[-1] keeps the in-loop mark (positions valued at
+    # closes[-1], no commission/slippage), leaving a persistent gap vs
+    # equity_closed[-1] whenever positions are still open at end-of-data.
+    equity_mtm[-1] = closed_equity
 
     # ── Build output series ──
     mtm_series = pd.Series(equity_mtm, index=timestamps, name="equity_mtm")

@@ -101,15 +101,22 @@ def build_features(
     # =====================================================================
     # ATR percentile (expanding rank, 0-100)
     # =====================================================================
+    # Both atr[i] and the rank that includes atr[i] require bar i's H/L/C.
+    # Shifting by 1 makes this column the percentile rank KNOWABLE at bar i's
+    # open — i.e. rank of atr[i-1] within atr[0..i-1]. Any consumer reading
+    # atr_percentile[i] at a bar-i entry is now lookahead-safe by definition.
     out["atr_percentile"] = (
         out["atr"].expanding(min_periods=atr_period).rank(pct=True) * 100.0
-    )
+    ).shift(1)
 
     # =====================================================================
     # Volatility regime (ATR vs expanding median — simple placeholder)
     # =====================================================================
-    atr_expanding_median = out["atr"].expanding(min_periods=_MIN_HISTORY).median()
-    out["vol_regime"] = np.where(out["atr"] > atr_expanding_median, "high", "low")
+    # Same lookahead reasoning as atr_percentile — compare the PRIOR bar's
+    # ATR against the expanding median up to the prior bar.
+    prev_atr = out["atr"].shift(1)
+    prev_atr_median = out["atr"].expanding(min_periods=_MIN_HISTORY).median().shift(1)
+    out["vol_regime"] = np.where(prev_atr > prev_atr_median, "high", "low")
 
     # =====================================================================
     # Session close flag

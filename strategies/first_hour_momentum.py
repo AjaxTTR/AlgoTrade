@@ -87,8 +87,12 @@ def generate_signals(
     # -- is_high_vol from pre-computed atr_percentile --
     out["is_high_vol"] = out["atr_percentile"] >= atr_percentile_min
 
-    # -- Daily ATR percentile: use the last bar before entry (just before 10:00) --
-    pre_entry = out[(time_vals >= t_session_start) & (time_vals < t_early_end)]
+    # -- Daily ATR percentile: use the entry-bar's atr_percentile.
+    # atr_percentile is now lag-1 safe (rank of atr[i-1] within atr[0..i-1]),
+    # so reading it at the 10:00 entry bar is equivalent to the previous
+    # pattern of reading atr_percentile at the 09:45 bar. Window is inclusive
+    # of t_early_end to pick up the 10:00 bar as the groupby's `last`. --
+    pre_entry = out[(time_vals >= t_session_start) & (time_vals <= t_early_end)]
     daily_atr_pctile = pre_entry.groupby("date")["atr_percentile"].last()
 
     # -- Early return expanding percentile threshold (no lookahead) --

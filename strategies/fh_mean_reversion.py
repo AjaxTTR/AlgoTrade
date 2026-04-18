@@ -80,8 +80,11 @@ def generate_signals(
         fh_percentile_lo / 100.0
     ).shift(1)
 
-    # -- Daily ATR percentile (use last bar before 10:30) --
-    pre_entry = out[(time_vals >= t_session_start) & (time_vals < t_fh_end)]
+    # -- Daily ATR percentile: read at the 10:30 entry bar.
+    # atr_percentile is now lag-1 safe; reading it at 10:30 matches the
+    # previous pattern of reading it at the 10:15 bar. Window inclusive of
+    # t_fh_end so the groupby's `last` picks up the 10:30 bar. --
+    pre_entry = out[(time_vals >= t_session_start) & (time_vals <= t_fh_end)]
     daily_atr_pctile = pre_entry.groupby("date")["atr_percentile"].last()
 
     # -- Classify qualifying days: extreme FH down + high vol --
