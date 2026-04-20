@@ -329,3 +329,44 @@ def add_session_segments(
     )
 
     return df
+
+
+# ---------------------------------------------------------------------------
+# Train/test split (single source of truth — every hypothesis uses these
+# boundaries so cross-hypothesis comparisons are valid)
+# ---------------------------------------------------------------------------
+
+TRAIN_TEST_BOUNDARY = pd.Timestamp("2023-01-01", tz="America/New_York")
+
+
+def split_train_test(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Split an OHLCV DataFrame into train / test at the fixed 70/30 boundary.
+
+    Boundary: 2023-01-01 (NY). Train covers 2018-2022 (5yr), test covers
+    2023-2024 (2yr). The boundary is a module-level constant so every
+    hypothesis uses identical windows.
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        Timezone-aware OHLCV frame from ``load_csv``.
+
+    Returns
+    -------
+    (train, test) : tuple of pd.DataFrame
+        Chronological split. Train is strictly before the boundary; test
+        is at or after.
+    """
+    if df.index.tz is None:
+        raise ValueError(
+            "split_train_test requires a timezone-aware index. "
+            "Load the frame via load_csv() first."
+        )
+    train = df[df.index < TRAIN_TEST_BOUNDARY]
+    test = df[df.index >= TRAIN_TEST_BOUNDARY]
+    logger.info(
+        "Train/test split: train=%d bars (%s -> %s), test=%d bars (%s -> %s)",
+        len(train), train.index.min(), train.index.max(),
+        len(test), test.index.min(), test.index.max(),
+    )
+    return train, test

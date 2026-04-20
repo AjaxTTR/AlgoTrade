@@ -4,91 +4,76 @@ This file provides guidance to Claude Code when working with code in this reposi
 
 ## Project Overview
 
-Python backtesting framework for NQ (Nasdaq 100) futures intraday strategies. Built for systematic day-trading research — no live execution, no external APIs.
+Python research library for NQ (Nasdaq 100) futures intraday strategies. Built as a reusable backtesting + validation engine that notebooks and strategy modules import from. No live execution, no external APIs, no global CLI harness — research is driven from Jupyter notebooks.
 
 ## Repository Structure
 
 ```
-main.py                              # Entry point: load data, run strategy, export results
-run_strategy.py                      # CLI wrapper to run any strategy by name
 engine/
-  data_loader.py                     # CSV ingestion and validation for OHLCV data
+  data_loader.py                     # CSV ingestion, timezone handling, session filtering
   backtester.py                      # Event-loop backtest engine with multi-position tracking
-  metrics.py                         # Performance metrics (Sharpe, CAGR, etc.) and plotting
-  feature_engineering.py             # Feature computation utilities
+  features.py                        # Feature computation (ATR, percentiles, FH metrics)
+  metrics.py                         # Performance metrics (Sharpe, CAGR, drawdown, MCPT)
   prop_firm.py                       # Prop firm challenge simulation (Monte Carlo)
-  external_data_guard.py             # Blocks accidental external data imports
-strategies/
-  gap_momentum.py                    # Gap-Up Momentum signal generator (the active strategy)
+strategies/                          # User-authored strategy modules (empty — awaiting hypotheses)
 research/
-  edge_analysis.py                   # Statistical edge discovery and conditional analysis
-  edge_to_strategy.py                # Edge-to-strategy conversion utilities
+  notebooks/                         # All exploratory research lives here
+  hypotheses/                        # Pre-registration templates and per-hypothesis specs
+  experiment_log.csv                 # Pre-registered expectation + final outcome per hypothesis
 data/
   nq_15m_data.csv                    # 7 years of NQ 15-min OHLCV (not in git)
-output/                              # All backtest artifacts land here (not in git)
+configs/                             # Reserved for shared config files (currently empty)
+venv/                                # Project virtual environment (not in git)
+requirements.txt                     # Pinned dependencies
+CLAUDE.md                            # This file
 ```
 
-## Running
+## How research runs
 
-```bash
-# Full backtest (outputs to output/)
-python main.py
+There is no CLI entry point. Research happens in notebooks under `research/notebooks/`, which import directly from `engine/`:
 
-# Run an arbitrary strategy module by name
-python run_strategy.py gap_momentum
+```python
+from engine.data_loader import load_csv
+from engine.backtester import run
+from engine.metrics import compute_metrics, print_metrics
+from engine.prop_firm import simulate_prop_firm
 ```
 
-Requires `data/nq_15m_data.csv` with columns: `timestamp, open, high, low, close, volume`
+Launch: `venv/Scripts/jupyter lab` — then open a notebook. Charts render inline. `research/notebooks/00_smoke_test.ipynb` is the reference template.
 
-## Current Configuration
+Data requirement: `data/nq_15m_data.csv` with columns `timestamp, open, high, low, close, volume`.
 
-**Backtest:**
-- Initial capital: $100,000
-- Risk per trade: 0.5% of equity
-- Point value: $20 (NQ futures)
-- Commission: $2/side, slippage: 0.25 pts
-- Daily drawdown limit: 2%
-- Max daily risk: 2% (blocks new entries if cumulative risk exceeds cap)
-- Max concurrent trades: 1 (single position at a time)
-- Min bars between entries: 2
-- Consecutive loss scaling: after 2 losses, halve position size (resets on next win)
-- Trailing stop: disabled
+## Collaboration model
 
-**Strategy (Gap-Up Momentum):**
-- Edge: Gap-up × FH_Up -> Rest_Up (t=30.39, stability=0.946), long only
-- Gap filter: session open > prior close by >= 0.10%
-- First-hour window: 09:30-10:30 ET; entry at 10:30
-- Bias filter: FH return >= 75th percentile of prior FH returns (expanding, no lookahead)
-- Session: 09:30-16:00 ET, entry cutoff 15:45
-- ATR period: 14, stop at 1.5x ATR, TP at 2.0x ATR
-- Holding period: 8 bars (2 hours on 15-min bars)
-- Max 1 trade/day, long only
+See `memory/feedback_collaboration_model.md` for the full spec. Summary:
 
-## Strategy Pipeline
+- **User** owns hypothesis generation, research direction, go/no-go decisions.
+- **Claude** owns implementation, methodological critique (contamination, lookahead, multiple testing, overfitting), teaching quant concepts on request, and engineering hygiene.
+- **Claude does NOT pitch strategy ideas, design edges from observed patterns, or tune parameters unprompted.**
 
-1. **Gap Detection** — Compute gap_pct = (session_open - prior_close) / prior_close; require gap_pct >= gap_threshold_pct
-2. **First-Hour Check** — Measure return from 09:30-10:30; require fh_return >= dynamic percentile threshold (expanding window, no lookahead)
-3. **Entry** — On qualifying days, enter long at 10:30 close
-4. **Risk Sizing** — ATR-based volatility sizing: equity * risk_per_trade / (ATR * point_value), supports size_factor column. Dynamic scaling: after 2 consecutive losses, position size halved until next win.
-5. **Trade Management** — Stop at 1.5x ATR below entry, TP at 2.0x ATR above; 8-bar holding period exit via max_bars_in_trade
-6. **Daily Limits** — Max 1 trade/day, 2% daily drawdown limit, pre-entry risk gate, max 1 concurrent position
+## Key conventions
 
-## Key Conventions
+- Strategy modules expose `generate_signals(df, **params) -> DataFrame` with a `signal` column.
+- The backtester is the single source of truth for fills, sizing, and PnL accounting.
+- Any new feature must be lookahead-safe at the column level (use `.shift(1)` on derived series).
+- All plotting happens inline in notebooks. No PNG dumps to disk by default.
+- No external data providers. Current dataset and any future OOS pulls are explicit and documented.
 
-- All output files go to `output/` (trade_log.csv, equity_curve.csv, drawdown_series.csv, performance_metrics.json, backtest_results.png)
-- No external API calls — data is loaded from local CSV only
-- Strategy modules expose `generate_signals(df, **params) -> DataFrame`
-- Backtester config and strategy config are separate dicts in main.py
-- Research tools share synced config with main.py where applicable
+## Research discipline
+
+- **Pre-register hypotheses before coding.** Use `research/hypotheses/TEMPLATE.md`. Record expectation in `experiment_log.csv` before running.
+- **Replicate first, adapt second.** For paper-derived hypotheses, reproduce the paper's headline number on its own instrument before porting to NQ.
+- **Current dataset is contaminated** through researcher degrees of freedom. Do not re-tune on it; treat it as training data only.
+- **Locked vault (2005–2015, not yet acquired):** reserved for one-shot validation of frozen strategies. Do not look at results on it until making a deployment decision.
 
 ## End-of-Session Protocol
 
 Before the session ends, **always** overwrite `memory/session-state.md` with a fresh snapshot of:
-- Current strategy config (exact parameters)
-- Latest backtest results (key numbers)
-- What's been tested and rejected (with reasons)
-- Current focus and next steps
-- Hard constraints
+- What was changed this session (specific files / line-level detail where material)
+- Current state of research direction
+- Hypotheses in flight (with reference to `research/hypotheses/` files)
+- Next-session resume point
+- Hard constraints or open questions
 
 This is the primary way context is preserved between sessions. Do not skip this.
 
@@ -96,5 +81,6 @@ This is the primary way context is preserved between sessions. Do not skip this.
 
 - Remote: `AjaxTTR/AlgoTrade` on GitHub
 - Branch: `main`
-- Commit and push changes after each meaningful modification
+- Commit after each meaningful change; push at end of session
 - Use clear, descriptive commit messages summarizing what changed and why
+- `nbstripout` is installed as a git filter — notebook outputs are stripped automatically on commit
