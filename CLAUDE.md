@@ -61,9 +61,25 @@ See `memory/feedback_collaboration_model.md` for the full spec. Summary:
 
 ## Research discipline
 
-- **Pre-register hypotheses before coding.** Use `research/hypotheses/TEMPLATE.md`. Record expectation in `experiment_log.csv` before running.
+- **Pre-register hypotheses before coding.**
+  - For pure measurement screens (conditional-behaviour existence checks, no strategy yet): use a screen-shaped pre-reg like `research/hypotheses/overnight_effect.md`.
+  - For strategy hypotheses: use `research/hypotheses/TEMPLATE_twogate.md` (two-gate pipeline, see below).
+  - For paper-replication-first hypotheses: `research/hypotheses/TEMPLATE.md` still applies.
 - **Replicate first, adapt second.** For paper-derived hypotheses, reproduce the paper's headline number on its own instrument before porting to NQ.
 - **Current dataset is contaminated** through researcher degrees of freedom. Do not re-tune on it; treat it as training data only.
+
+## Two-gate pipeline (strategy hypotheses)
+
+Every strategy pre-registration runs through two independent gates on the training slice before earning the right to touch the sealed test slice.
+
+- **Gate 1 — Edge existence.** Does the proposed conditional behaviour measure positive and stable on training data? Pure edge detection, no prop-firm mechanics. Criteria: monotonicity / significance / stability across halves, pre-registered per hypothesis.
+- **Gate 2 — MFFU Phase 1 viability.** Only reached if Gate 1 passes. Does a strategy implementing the edge survive MFFU Phase 1 mechanics (EOD trailing DD, 50% consistency rule, $6k target on $100k account) under Monte Carlo trade-order shuffling? Use `engine.prop_firm.simulate_prop_firm` with `MFFU_PHASE1_100K`.
+- **Parameter optimisation inside Gate 2 must be pre-registered.** Tunable parameters, search grid, and mechanical selection rule are locked in the hypothesis file before any code runs. Post-hoc "this one looked better" is overfitting.
+- **Sealed test slice (2023–2024)** is touched exactly once per hypothesis, and only if both gates passed. No re-runs, no re-tuning.
+
+Malleability: the pipeline itself can evolve between hypotheses. Within a single hypothesis, everything above the Test log section is frozen at commit time.
+
+- **Target prop firm: MFFU (My Funded Futures).** Phase 1 mechanics are the sole prop-firm model in `engine/prop_firm.py`. FTMO-style rules were removed deliberately to prevent cross-contamination between rulesets.
 - **Locked vault (2005–2015, not yet acquired):** reserved for one-shot validation of frozen strategies. Do not look at results on it until making a deployment decision.
 
 ## End-of-Session Protocol
