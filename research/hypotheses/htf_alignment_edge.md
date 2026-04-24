@@ -226,66 +226,115 @@ researcher-degrees-of-freedom contamination.
 ## Test log (populated AFTER pre-registered sections above are locked — do not edit above)
 
 ### Screen run
-- **Date:**
+- **Date:** 2026-04-24
 - **Notebook:** `research/notebooks/screen_htf_alignment.ipynb`
-- **Commit hash of code at time of run:**
-- **Training slice used:**
-- **Observation bars after session mask:**
-- **Bars per composite bucket:**
+- **Commit hash of pre-reg at time of run:** `f848afb`
+- **Training slice used:** 2018-01-02 → 2022-12-30 (116,696 15-min bars raw; 33,724 RTH bars)
+- **Observation bars after session mask + non-NaN features:** 28,816
+- **Observation range:** 2018-01-02 09:30 ET → 2022-12-30 15:00 ET
 
 #### Per-bucket counts
 | Composite state | n |
 |---|---|
-| +1 (both bullish) | |
-| 0 (conflict/flat) | |
-| −1 (both bearish) | |
+| +1 (both bullish) | 11,099 |
+| 0 (conflict/flat) | 10,283 |
+| −1 (both bearish) | 7,434 |
 
 #### Primary table — de-meaned forward returns, full training slice
-| Composite state | fwd_15m (co-primary) | fwd_1h (co-primary) | fwd_4h (diagnostic) |
-|---|---|---|---|
-| +1 | | | |
-| 0 | | | |
-| −1 | | | |
+| Composite state | fwd_15m (co-primary) | fwd_1h (co-primary) |
+|---|---|---|
+| +1 | +0.00145% | +0.01086% |
+| 0 | +0.00147% | −0.00184% |
+| −1 | −0.00420% | −0.01366% |
+
+(Unconditional means pre-de-meaning: fwd_15m +0.00105%, fwd_1h +0.00276%.)
 
 #### Newey-West HAC 97.5% CIs on 15m horizon (co-primary)
 | Composite state | Mean | 97.5% CI | Excludes 0? |
 |---|---|---|---|
-| +1 | | | |
-| 0 | | | |
-| −1 | | | |
+| +1 | +0.00145% | [−0.00197%, +0.00488%] | No |
+| 0 | +0.00147% | [−0.00412%, +0.00705%] | No |
+| −1 | −0.00420% | [−0.01043%, +0.00204%] | No |
 
 #### Newey-West HAC 97.5% CIs on 1h horizon (co-primary)
 | Composite state | Mean | 97.5% CI | Excludes 0? |
 |---|---|---|---|
-| +1 | | | |
-| 0 | | | |
-| −1 | | | |
+| +1 | +0.01086% | [−0.00148%, +0.02319%] | No (miss by ~1.5 bp) |
+| 0 | −0.00184% | [−0.02089%, +0.01720%] | No |
+| −1 | −0.01366% | [−0.03678%, +0.00946%] | No |
 
 #### Diagnostic 2×2 interaction table (1h horizon, de-meaned)
-| 1H \ 4H | + | 0 | − |
+| 1H \ 4H | +1 | 0 | −1 |
 |---|---|---|---|
-| + | | | |
-| 0 | | | |
-| − | | | |
+| +1 | +0.01086% (n=11,099) | +0.04334% (n=34) | +0.01370% (n=4,922) |
+| 0 | −0.06636% (n=18) | +0.10217% (n=22) | −0.25836% (n=20) |
+| −1 | −0.01618% (n=5,248) | +0.06266% (n=19) | −0.01366% (n=7,434) |
+
+The `(1H+, 4H−)` cell at +0.01370% is indistinguishable from the `(1H+, 4H+)` agreement cell at +0.01086%. Same on the bearish side: `(1H−, 4H+)` at −0.01618% vs `(1H−, 4H−)` at −0.01366%. The 1H state drives essentially all the separation; the 4H filter adds no incremental signal over the 1H alone. The `state_4h == 0` cells are small-sample noise (MA slopes on 4H are almost never exactly zero).
 
 #### Stability — Half A vs Half B (15m horizon)
 | Composite state | Half A mean | Half B mean | Signs preserved? |
 |---|---|---|---|
-| +1 | | | |
-| 0 | | | |
-| −1 | | | |
+| +1 | +0.00055% | +0.00241% | Yes |
+| 0 | +0.00250% | +0.00038% | n/a (no required sign) |
+| −1 | −0.00350% | −0.00478% | Yes |
 
 #### Stability — Half A vs Half B (1h horizon)
 | Composite state | Half A mean | Half B mean | Signs preserved? |
 |---|---|---|---|
-| +1 | | | |
-| 0 | | | |
-| −1 | | | |
+| +1 | +0.00865% | +0.01320% | Yes |
+| 0 | +0.00921% | −0.01340% | n/a (flipped; no required sign) |
+| −1 | −0.02127% | −0.00735% | Yes |
 
 ### Decision
-- **Passed / failed:**
-- **Which criterion was the binding one:**
+- **Passed / failed:** **FAIL**
+- **Which criteria were binding:** Criteria 1 and 2 — neither agreement bucket's CI excluded zero at the Bonferroni-adjusted 97.5% level on either co-primary horizon. Criteria 3 (conflict bucket between agreement buckets on 1h) and 4 (signs preserved across both halves on both horizons) both passed. The directional pattern was correct; magnitudes were insufficient.
 - **Commentary:**
+
+  The HTF dual-timeframe trend filter, as pre-registered, does not
+  produce a conditional forward-return effect on NQ 15-min bars that
+  clears the Bonferroni-adjusted significance bar for two co-primary
+  horizons. Directionally the pattern is consistent with time-series
+  momentum (+1 bucket positive, −1 bucket negative, both stable across
+  training halves), but the effect size is roughly the same order of
+  magnitude as its standard error. The 1h bucket for `+1` misses the
+  CI-excludes-zero bar by ~1.5 bp, which means a looser threshold
+  (unadjusted 95% one-horizon) would have cleared — but that would
+  have been a post-hoc adjustment, which is exactly what
+  pre-registration prevents.
+
+  **Observations flagged for the record (not acted on):**
+  - **The 4H filter is doing no work.** The 2×2 interaction table
+    shows `(1H+, 4H+)` and `(1H+, 4H−)` have nearly identical means
+    (+0.0109% vs +0.0137%). Same on the bearish side. The dual-filter
+    requirement does not improve separation over a 1H-only filter.
+    This is a genuine diagnostic finding: if a follow-up were
+    pre-registered, a simpler 1H-only filter would be the honest
+    version.
+  - **The magnitudes are plausibly real but low-powered.** At n ≈ 10k
+    bars per bucket with 15-min return std ≈ 0.24%, detecting a 1-bp
+    effect at 97.5% requires meaningfully more data or a lower
+    variance regime. The budget cost of another screen to try to
+    detect this more finely is not justified given (a) the 4H
+    filter's redundancy and (b) two consecutive training-slice
+    screens having now failed.
+  - **Neutral-bucket (0) behaviour at 1h flipped between halves**
+    (+0.9 bp Half A, −1.3 bp Half B). No pre-registered prediction,
+    but worth noting — suggests the conflict bucket is dominated by
+    regime-dependent noise rather than structural information.
+
+  **Budget note:** This screen spent the second training-slice
+  judgment unit. Prior spend: 1 (overnight_effect FAIL). Running
+  total: 2 screens spent, both FAIL. Each additional training-slice
+  screen compounds contamination; the next move warrants a pause to
+  reconsider whether further naive-feature screens are the right
+  budget allocation, or whether a different research path (framework-
+  derived hypothesis under `TEMPLATE_twogate.md`, or deeper reading
+  before committing) is a better use of remaining budget.
+
+### If passed — next step
+Not applicable. Screen failed; test slice remains sealed. Hypothesis
+file archived as-is. No re-parameterization permitted.
 
 ### If passed — next step
 Pass does NOT grant test-slice access. It authorises drafting a
