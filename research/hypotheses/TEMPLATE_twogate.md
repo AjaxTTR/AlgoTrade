@@ -133,7 +133,11 @@ loosen only with explicit reasoning recorded here:
 - [ ] Monte Carlo pass rate ≥ 50% (with 95% Wilson CI lower bound > 40%)
 - [ ] P(fail on trailing DD) ≤ 30%
 - [ ] Observed max_day_frac at pass ≤ 0.5 on ≥ 80% of passing sims
-- [ ] Median days-to-pass ≤ 30 calendar days
+- [ ] Median days-to-pass ≤ [N] calendar days — **malleable per hypothesis.**
+      Default 30, but prop-firm time limits have loosened industry-wide,
+      so this threshold may be set higher (e.g. 45, 60) per hypothesis
+      with reasoning recorded. Lock the chosen value in the hypothesis
+      file before running; do not adjust post-hoc.
 
 ### Gate 2 fail criteria (ANY one kills)
 -
