@@ -149,30 +149,96 @@ template rather than continue naive screens.
 ## Test log (populated AFTER pre-registered sections above are locked — do not edit above)
 
 ### Screen run
-- **Date:** _to be filled after run_
-- **Notebook:** _to be filled after run_
-- **Commit hash of code at time of run:** _to be filled after run_
-- **Training slice used:** 2018-01-02 → 2022-12-30
-- **Trading days with valid `open_return` and `fwd_close`:** _to be filled_
-- **Days after 252-day burn-in, with assigned bucket:** _to be filled_
-- **Days excluded (missing 09:30, 10:00, or 15:45 bar):** _to be filled_
+- **Date:** 2026-04-30
+- **Notebook:** `research/notebooks/screen_open_momentum.ipynb`
+- **Commit hash of code at time of run:** `6bc2fc2` (pre-registration commit; no code changes before execution)
+- **Training slice used:** 2018-01-02 → 2022-12-30 (116,696 15-min bars)
+- **Trading days with valid `open_return`:** 1,270
+- **Days after 252-day burn-in, with assigned bucket:** 1,018 (2018-12-31 → 2022-12-30)
+- **Days excluded from `fwd_close` horizon:** 44 (early-close sessions missing the 15:45 bar)
+- **Days excluded from `fwd_2h` horizon:** 3
+- **Days excluded from `fwd_4h` horizon:** 44
 
 #### Per-bucket counts
-_to be filled_
+| Bucket | n |
+|---|---|
+| Q1 | 234 |
+| Q2 | 189 |
+| Q3 | 177 |
+| Q4 | 182 |
+| Q5 | 236 |
 
 #### Main bucket table — de-meaned forward returns (full training slice, post burn-in)
-_to be filled_
+| Bucket | fwd_close | fwd_2h | fwd_4h |
+|---|---|---|---|
+| Q1 | −0.018% | −0.011% | −0.052% |
+| Q2 | −0.044% | −0.050% | −0.003% |
+| Q3 | −0.018% | +0.025% | +0.009% |
+| Q4 | −0.070% | −0.068% | −0.055% |
+| Q5 | +0.116% | +0.086% | +0.088% |
 
 #### Bootstrap 95% CIs on the primary horizon (`fwd_close`)
-_to be filled_
+| Bucket | Mean | 95% CI | Excludes 0? |
+|---|---|---|---|
+| Q1 | −0.018% | [−0.205%, +0.172%] | No |
+| Q2 | −0.044% | [−0.185%, +0.091%] | No |
+| Q3 | −0.018% | [−0.160%, +0.123%] | No |
+| Q4 | −0.070% | [−0.223%, +0.082%] | No |
+| Q5 | +0.116% | [−0.033%, +0.263%] | No (just barely) |
 
-#### Stability — Half A vs Half B
-_to be filled_
+No bucket on the primary horizon excludes zero. Q5 came closest — the lower edge of its CI is at −0.033%, brushing zero from above.
+
+#### Stability — Half A (n=381, 2018-12-31 → 2020-06-30) vs Half B (n=637, 2020-07-01 → 2022-12-30)
+| Bucket | Half A fwd_close mean | Half B fwd_close mean |
+|---|---|---|
+| Q1 | **+0.196%** | **−0.124%** |
+| Q2 | +0.002% | −0.077% |
+| Q3 | −0.067% | +0.013% |
+| Q4 | −0.065% | −0.073% |
+| Q5 | +0.152% | +0.095% |
+
+Q1 flips sign between halves (+19.6 bps → −12.4 bps), the same fingerprint observed in the overnight screen. In Half A, big down-opens *bounced* (reversal regime); in Half B, big down-opens *continued down* (continuation regime). Q5 is positive in both halves, but its magnitude is order-of-noise once CIs are considered.
 
 ### Decision
-- **Passed / failed:** _to be filled_
-- **Which criterion was the binding one:** _to be filled_
-- **Commentary:** _to be filled_
+- **Passed / failed:** **FAIL**
+- **Which criterion was the binding one:** Three of four failed independently.
+  1. Monotonicity on full slice: zigzag (Q1 −0.02, Q2 −0.04, Q3 −0.02, Q4 −0.07, Q5 +0.12). Not monotonic increasing.
+  2. Extreme-bucket significance: Q1 and Q5 `fwd_close` CIs both contain zero (Q5 barely; Q1 widely).
+  3. Predicted signs: PASS — Q1 negative, Q5 positive on full slice. The only criterion satisfied.
+  4. Stability: Half A and Half B disagree on Q1 sign. Half A is reversal-shaped (Q1 strongly positive); Half B is continuation-shaped (Q1 strongly negative).
+- **Commentary:**
+  The open momentum / continuation hypothesis, as pre-registered on NQ
+  15-min futures with 30-min opening window and 09:30→10:00 ET reference
+  prices, **does not hold on the 2018-2022 training slice**. Q5 (biggest
+  up-opens) showed the predicted continuation pattern in both halves and
+  on the full slice, but its 95% CI on `fwd_close` straddles zero by ~3
+  bps on the lower edge — too close to call from this slice alone. The
+  middle buckets show no coherent pattern.
+
+  **Cross-screen pattern (flagged for the record, not acted on):**
+  Q1 sign-flip between halves is now observed on **two** screens
+  (overnight effect, open momentum). Both show:
+  - Half A (2018 → mid-2020): big down-moves *bounce up* (reversal).
+  - Half B (mid-2020 → 2022): big down-moves *continue down* (momentum).
+  This is consistent with a structural shift around the COVID dislocation
+  and the subsequent rate-hike cycle. Any pre-registered claim that
+  requires stability across this 2020-07 boundary on the current
+  training slice is therefore working with a dataset that contains two
+  qualitatively different regimes averaged together. This is a property
+  of the data, not of the screens.
+
+  Q5 positivity is consistent across both halves and across all three
+  horizons in this screen (~+10 bps de-meaned). Acting on it as
+  evidence of a one-sided up-open continuation effect would be data-
+  derived hypothesizing off this screen — not legitimate without a
+  fresh slice or a fresh pre-registration. Deferred.
+
+  **Budget note:** This screen spent the third unit of training-slice
+  judgment budget. Three for three on FAIL on the same training slice.
+  The methodological prior strengthens further toward (a) sourcing a
+  fresh slice before any further screening on this dataset, or (b)
+  pivoting to a framework-derived two-gate hypothesis with explicit
+  regime-handling, rather than continuing naive screens.
 
 ### If passed — formal test on 2023–2024
-_to be filled_
+Not applicable. Screen failed; test slice remains sealed.
