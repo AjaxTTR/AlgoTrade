@@ -68,18 +68,18 @@ See `memory/feedback_collaboration_model.md` for the full spec. Summary:
 - **Replicate first, adapt second.** For paper-derived hypotheses, reproduce the paper's headline number on its own instrument before porting to NQ.
 - **Current dataset is contaminated** through researcher degrees of freedom. Do not re-tune on it; treat it as training data only.
 
-## Two-gate pipeline (strategy hypotheses)
+## Two-gate pipeline v2 (strategy hypotheses)
 
-Every strategy pre-registration runs through two independent gates on the training slice before earning the right to touch the sealed test slice.
+Every strategy pre-registration runs through two independent gates on the training slice before earning the right to touch the sealed test slice. Full specs live in `research/methodology/gate1_v2.md` and `gate2_v2.md`. Summary:
 
-- **Gate 1 — Edge existence.** Does the proposed conditional behaviour measure positive and stable on training data? Pure edge detection, no prop-firm mechanics. Criteria: monotonicity / significance / stability across halves, pre-registered per hypothesis.
-- **Gate 2 — MFFU Phase 1 viability.** Only reached if Gate 1 passes. Does a strategy implementing the edge survive MFFU Phase 1 mechanics (EOD trailing DD, 50% consistency rule, $6k target on $100k account) under Monte Carlo trade-order shuffling? Use `engine.prop_firm.simulate_prop_firm` with `MFFU_PHASE1_100K`.
-- **Parameter optimisation inside Gate 2 must be pre-registered.** Tunable parameters, search grid, and mechanical selection rule are locked in the hypothesis file before any code runs. Post-hoc "this one looked better" is overfitting.
-- **Sealed test slice (2023–2024)** is touched exactly once per hypothesis, and only if both gates passed. No re-runs, no re-tuning.
+- **Gate 1 — Measurement, not pass/fail.** Runs the signal through a locked default execution wrapper (1.5× ATR stop, 2× ATR TP, EOD exit, unit sizing, $5 RT cost) and reports six elements as STRONG/WEAK indicators against malleable reference thresholds: profit factor net, total net P&L, sample size, single-day concentration, half-stability, profit/maxDD. User makes the call on whether to progress. Code: `engine/gate1.py`.
+- **Gate 2 — Walk-forward MFFU Phase 1 viability.** 18-month train / 6-month test, slid 6 months forward across 2017–2022 (~9 chunks). Per chunk: tune within a pre-registered grid (max 3 parameters, ≤27 combos) by in-sample MFFU pass rate; measure OOS pass rate on the test tail. Cross-chunk aggregation: median OOS pass rate, ties broken by lowest cross-chunk variance. This aggregation rule is the load-bearing anti-cherry-pick guardrail. Code: `engine/gate2.py`.
+- **Parameter grid is pre-registered.** Tunable parameters, search grid, and selection rule are locked in the hypothesis file before any code runs. The 3-parameter / 27-combo cap is enforced at runtime.
+- **Sealed test slice (2023–2024)** is touched exactly once per hypothesis, and only if both gates produced strong results. No re-runs, no re-tuning.
 
-Malleability: the pipeline itself can evolve between hypotheses. Within a single hypothesis, everything above the Test log section is frozen at commit time.
+**Malleability discipline (Gate 1 and Gate 2):** thresholds, default execution wrapper, walk-forward shape, and grid scope are all **forward-looking malleable**. Change them before a run, never after seeing the result. Pre-registration captures whatever was active at commit time and the result is judged against that snapshot.
 
-- **Target prop firm: MFFU (My Funded Futures).** Phase 1 mechanics are the sole prop-firm model in `engine/prop_firm.py`. FTMO-style rules were removed deliberately to prevent cross-contamination between rulesets.
+- **Target prop firm: MFFU (My Funded Futures).** Phase 1 mechanics are the sole prop-firm model in `engine/prop_firm.py`. The Monte Carlo simulator now permutes whole-day PnL blocks (the trade-level shuffle was biased optimistic for EOD-trailing rules and was replaced 2026-05-05).
 - **Locked vault (2005–2015, not yet acquired):** reserved for one-shot validation of frozen strategies. Do not look at results on it until making a deployment decision.
 
 ## End-of-Session Protocol

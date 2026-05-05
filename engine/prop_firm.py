@@ -14,9 +14,11 @@ Models the MFFU Phase 1 evaluation:
     is reclassified FAIL (reason = "consistency_rule").
   - No time limit on Phase 1.
 
-Monte Carlo shuffles trade order to estimate pass rate across different
-sequencings. See priority-list file for a known limitation in how
-shuffled trades are re-dated.
+Monte Carlo shuffles **whole-day order** rather than individual trades.
+Day-level permutation preserves the empirical intra-day PnL clustering,
+which is the binding driver of EOD trailing drawdown and consistency
+rule outcomes. Trade-level permutation (the prior implementation)
+artificially smoothed the equity curve and biased pass rates optimistic.
 
 Phase 2 (the funded-account payout structure) is NOT modelled here.
 Phase 2 is an economic/payout question, not a pass/fail question, and
@@ -213,12 +215,13 @@ def simulate_prop_firm(
 ) -> dict:
     """Monte Carlo MFFU Phase 1 challenge simulation.
 
-    Config defaults to MFFU_PHASE1_100K. Shuffles trade order and replays
-    against MFFU rules. Trades keep their original PnL distribution; the
-    date assignment for shuffled trades preserves the original number of
-    trades per day but NOT which specific PnLs clustered together — this
-    is a known limitation for EOD-trailing simulation and is tracked in
-    the priority list.
+    Config defaults to MFFU_PHASE1_100K. Permutes the order of whole
+    trading days (each day's intra-day PnL sequence is preserved as an
+    atomic unit), then replays against MFFU rules. Day-level permutation
+    is the methodologically correct shuffle for EOD-trailing-DD and
+    consistency-rule simulation: those rules are computed per day, so
+    breaking up which PnLs clustered on which day biases pass rates
+    optimistic. The previous trade-level shuffle is gone.
     """
     cfg = {**MFFU_PHASE1_100K, **(config or {})}
     trades = result.trades
@@ -227,25 +230,47 @@ def simulate_prop_firm(
         return _empty_result(cfg)
 
     rng = np.random.default_rng(seed)
-    pnls = np.array([t.pnl for t in trades])
-    exit_dates = np.array([t.exit_time.date() for t in trades])
 
-    unique_dates = np.unique(exit_dates)
-    trades_per_day = np.array([np.sum(exit_dates == d) for d in unique_dates])
-    day_boundaries = np.concatenate([[0], np.cumsum(trades_per_day)])
+    trades_sorted = sorted(trades, key=lambda t: t.exit_time)
+    pnls_actual = np.array([t.pnl for t in trades_sorted])
+    dates_actual = np.array([t.exit_time.date() for t in trades_sorted])
 
-    shuffled_dates_template = np.empty(len(pnls), dtype=exit_dates.dtype)
-    for d_idx, d in enumerate(unique_dates):
-        start, end = day_boundaries[d_idx], day_boundaries[d_idx + 1]
-        shuffled_dates_template[start:end] = d
+    # Group into per-day blocks. Each block is an atomic unit for shuffling:
+    # within-day PnL sequence is preserved, only the order of days varies.
+    unique_dates = []
+    day_blocks: list[np.ndarray] = []
+    cursor = 0
+    while cursor < len(pnls_actual):
+        d = dates_actual[cursor]
+        end = cursor
+        while end < len(pnls_actual) and dates_actual[end] == d:
+            end += 1
+        unique_dates.append(d)
+        day_blocks.append(pnls_actual[cursor:end])
+        cursor = end
+    unique_dates_arr = np.array(unique_dates)
+    n_days = len(day_blocks)
 
-    actual = _simulate_single(pnls, exit_dates, cfg)
+    actual = _simulate_single(pnls_actual, dates_actual, cfg)
 
+    # For the synthetic calendar we re-stamp shuffled blocks onto the
+    # original unique_dates in sequence (block at position k in the
+    # shuffled order gets unique_dates_arr[k]). This keeps day rollover
+    # detection trivial, preserves a monotonic date axis (so days_elapsed
+    # is sensible), and isolates the only source of randomness as
+    # *which day's PnL block lands on which calendar slot*.
     sims = []
     for _ in range(n_simulations):
-        shuffled_idx = rng.permutation(len(pnls))
-        shuffled_pnls = pnls[shuffled_idx]
-        sims.append(_simulate_single(shuffled_pnls, shuffled_dates_template, cfg))
+        day_order = rng.permutation(n_days)
+        shuffled_pnl_chunks = [day_blocks[idx] for idx in day_order]
+        shuffled_dates_chunks = [
+            np.full(len(day_blocks[idx]), unique_dates_arr[k],
+                    dtype=dates_actual.dtype)
+            for k, idx in enumerate(day_order)
+        ]
+        shuffled_pnls = np.concatenate(shuffled_pnl_chunks)
+        shuffled_dates = np.concatenate(shuffled_dates_chunks)
+        sims.append(_simulate_single(shuffled_pnls, shuffled_dates, cfg))
 
     outcomes = [s["outcome"] for s in sims]
     n_pass = sum(1 for o in outcomes if o == "PASS")
