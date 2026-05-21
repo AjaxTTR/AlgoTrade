@@ -256,7 +256,13 @@ def gate2_evaluate(
 
         for combo in combos:
             train_signals = signal_fn(train_data, **combo)
-            train_bt = run(train_signals, **wrapper)
+            # Combo keys are routed into BOTH signal_fn and the wrapper.
+            # signal_fn consumes the keys it cares about and ignores the rest
+            # via **_; the backtester's run() accepts arbitrary **kwargs, so
+            # signal-side keys passed here are absorbed harmlessly. This lets
+            # the grid tune wrapper-level knobs (e.g. stop_atr_multiple)
+            # alongside signal-level ones (e.g. entry_z).
+            train_bt = run(train_signals, **{**wrapper, **combo})
             train_pf = simulate_prop_firm(
                 train_bt, n_simulations=n_simulations, seed=seed,
             )
@@ -268,7 +274,7 @@ def gate2_evaluate(
 
         # OOS measurement on test tail with selected combo
         test_signals = signal_fn(test_data, **best_combo) if best_combo is not None else test_data
-        test_bt = run(test_signals, **wrapper)
+        test_bt = run(test_signals, **{**wrapper, **(best_combo or {})})
         test_pf = simulate_prop_firm(
             test_bt, n_simulations=n_simulations, seed=seed,
         )
