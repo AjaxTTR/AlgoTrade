@@ -55,11 +55,6 @@ class _Position:
     stop_distance: float = 0.0
     prev_mtm: float = 0.0
     strategy_name: str = ""
-    pending_signal_exit: bool = False  # signal-mode regime stop: exit at next bar's open
-    # Two-stage signal-mode trailing exit state:
-    signal_trail_active: bool = False  # set sticky-True once trail-trigger fires at a bar close
-    signal_trail_stop: float = float("nan")  # highest prior-bar low since trail activation
-    signal_hard_stop: float = float("nan")  # ATR-based hard floor in signal mode (full life of trade)
 
 
 @dataclass
@@ -110,8 +105,6 @@ def run(
     sizing_mode: str = "compounding",
     fixed_contracts: int = 1,
     strategy_name: str = "",
-    exit_mode: str = "atr",
-    signal_hard_stop_atr_multiple: float = 0.0,
     **kwargs,
 ) -> BacktestResult:
     """Execute a backtest over a signal DataFrame.
@@ -242,36 +235,11 @@ def run(
     if sizing_mode == "fixed_contract" and fixed_contracts < 1:
         raise ValueError(f"fixed_contracts must be >= 1, got {fixed_contracts}")
 
-    if exit_mode not in ("atr", "signal"):
-        raise ValueError(f"exit_mode must be 'atr' or 'signal', got {exit_mode!r}")
-
-    # ATR is required for ATR-mode stop/TP. In signal mode it's still useful
-    # for vol-sized sizing (only when sizing_mode='compounding') — required
-    # there, otherwise optional.
-    needs_atr = (exit_mode == "atr") or (sizing_mode == "compounding" and use_volatility_sizing)
-    if needs_atr and "atr" not in signals.columns:
-        raise ValueError("signals DataFrame must contain an 'atr' column for stop/TP/sizing computation")
-    atrs = signals["atr"].values if "atr" in signals.columns else np.full(len(signals), np.nan)
-    has_atr = "atr" in signals.columns
-
-    # Signal-mode exit columns (only consulted when exit_mode == "signal")
-    if exit_mode == "signal":
-        if "exit_tp_price" not in signals.columns:
-            raise ValueError("exit_mode='signal' requires 'exit_tp_price' column")
-        if "exit_signal_stop" not in signals.columns:
-            raise ValueError("exit_mode='signal' requires 'exit_signal_stop' column")
-        exit_tp_prices = signals["exit_tp_price"].values
-        exit_signal_stops = signals["exit_signal_stop"].fillna(False).astype(bool).values
-        # Optional two-stage trail trigger column. Per-bar boolean — when True
-        # at bar close, position becomes (or stays) trail-active.
-        if "exit_trail_active" in signals.columns:
-            exit_trail_active_arr = signals["exit_trail_active"].fillna(False).astype(bool).values
-        else:
-            exit_trail_active_arr = np.zeros(len(signals), dtype=bool)
-    else:
-        exit_tp_prices = None
-        exit_signal_stops = None
-        exit_trail_active_arr = None
+    # ATR is required for stop/TP computation
+    if "atr" not in signals.columns:
+        raise ValueError("signals DataFrame must contain an 'atr' column for stop/TP computation")
+    atrs = signals["atr"].values
+    has_atr = True
 
     # Optional columns
     session_closes = signals["session_close"].values if "session_close" in signals.columns else np.zeros(len(closes), dtype=bool)
@@ -443,55 +411,6 @@ def run(
             fill_price = np.nan
             exit_reason = ""
 
-            # Signal-mode: update trail level BEFORE exit checks if trail is
-            # active. Trail tracks the highest prior-bar low since activation.
-            # At bar i, the prior bar's low is lows[i-1] (known).
-            if exit_mode == "signal" and pos.signal_trail_active and i >= 1:
-                if pos.direction == 1:
-                    if np.isnan(pos.signal_trail_stop) or lows[i - 1] > pos.signal_trail_stop:
-                        pos.signal_trail_stop = lows[i - 1]
-                else:
-                    if np.isnan(pos.signal_trail_stop) or highs[i - 1] < pos.signal_trail_stop:
-                        pos.signal_trail_stop = highs[i - 1]
-
-            # Signal-mode hard ATR floor — sticky, full life of trade.
-            # Highest priority among same-bar exits (caps catastrophic loss).
-            if (not exited and exit_mode == "signal"
-                    and not np.isnan(pos.signal_hard_stop)):
-                if pos.direction == 1 and lows[i] <= pos.signal_hard_stop:
-                    fill_price = min(pos.signal_hard_stop, opens[i]) - market_cost
-                    exited = True
-                    exit_reason = "hard_stop"
-                elif pos.direction == -1 and highs[i] >= pos.signal_hard_stop:
-                    fill_price = max(pos.signal_hard_stop, opens[i]) + market_cost
-                    exited = True
-                    exit_reason = "hard_stop"
-
-            # Signal-mode trail break — exit at market on trail violation.
-            if (not exited and exit_mode == "signal"
-                    and pos.signal_trail_active
-                    and not np.isnan(pos.signal_trail_stop)):
-                if pos.direction == 1 and lows[i] <= pos.signal_trail_stop:
-                    fill_price = min(pos.signal_trail_stop, opens[i]) - market_cost
-                    exited = True
-                    exit_reason = "trail_stop"
-                elif pos.direction == -1 and highs[i] >= pos.signal_trail_stop:
-                    fill_price = max(pos.signal_trail_stop, opens[i]) + market_cost
-                    exited = True
-                    exit_reason = "trail_stop"
-
-            # Signal-mode regime stop fired at the prior bar's close — fill
-            # at THIS bar's open (close-of-bar evaluation, next-bar-open
-            # execution). Highest priority: pre-empts ATR stop/TP for this bar.
-            if not exited and pos.pending_signal_exit:
-                fill_price = opens[i]
-                if pos.direction == 1:
-                    fill_price -= market_cost
-                else:
-                    fill_price += market_cost
-                exited = True
-                exit_reason = "signal_stop"
-
             # Max loss per trade cap
             if not exited and max_loss_per_trade > 0:
                 unrealised = pos.direction * (closes[i] - pos.entry_price) * pos.size * point_value
@@ -532,21 +451,6 @@ def run(
                         fill_price = max(pos.trail_stop, opens[i]) + market_cost
                         exited = True
                         exit_reason = "trailing_stop"
-
-            # Signal-mode TP: per-bar limit price from exit_tp_prices column.
-            # Long: exit if bar.high >= tp_price (intra-bar limit touch).
-            if (not exited and exit_mode == "signal"
-                    and exit_tp_prices is not None
-                    and not np.isnan(exit_tp_prices[i])):
-                tp_px = exit_tp_prices[i]
-                if pos.direction == 1 and highs[i] >= tp_px:
-                    fill_price = max(tp_px, opens[i]) - limit_cost
-                    exited = True
-                    exit_reason = "target"
-                elif pos.direction == -1 and lows[i] <= tp_px:
-                    fill_price = min(tp_px, opens[i]) + limit_cost
-                    exited = True
-                    exit_reason = "target"
 
             # Take-profit / partial TP
             if not exited and not np.isnan(pos.tp_price):
@@ -624,30 +528,6 @@ def run(
         for pidx in reversed(to_remove):
             positions.pop(pidx)
 
-        # Signal-mode regime stop: arm pending exit if z-threshold tripped at
-        # this bar's close. Fill happens at next bar's open (handled at top of
-        # the exit loop on bar i+1).
-        if (exit_mode == "signal" and exit_signal_stops is not None
-                and exit_signal_stops[i]):
-            for pos in positions:
-                pos.pending_signal_exit = True
-
-        # Signal-mode two-stage trail activation. When the trail-trigger
-        # column is True at bar close, surviving positions flip to
-        # trail-active (sticky — once True, stays True). Initialise the
-        # trail-stop level from THIS bar's low/high (the activation bar's
-        # known low/high). Subsequent bars will ratchet via lows[i-1] /
-        # highs[i-1] in the exit loop.
-        if (exit_mode == "signal" and exit_trail_active_arr is not None
-                and exit_trail_active_arr[i]):
-            for pos in positions:
-                if not pos.signal_trail_active:
-                    pos.signal_trail_active = True
-                    if pos.direction == 1:
-                        pos.signal_trail_stop = lows[i]
-                    else:
-                        pos.signal_trail_stop = highs[i]
-
         # ── 3. Fill pending entry ──
         if (pending_signal != 0 and i >= pending_fill_bar
                 and not halted and not daily_halted):
@@ -671,28 +551,21 @@ def run(
                 # bar i's high/low/close, which a real-time trader does not
                 # know at the open of bar i. Using atrs[i] is lookahead.
                 atr_at_fill = atrs[i - 1]
-
-                # In signal mode, stop/TP are driven by per-bar columns, not
-                # ATR — leave the position's static stop_price/tp_price NaN.
-                if exit_mode == "signal":
-                    stop_val = np.nan
-                    tp_val = np.nan
+                if not np.isnan(atr_at_fill) and atr_at_fill > 0 and stop_atr_multiple > 0:
+                    if sig == 1:
+                        stop_val = fill_price - atr_at_fill * stop_atr_multiple
+                    else:
+                        stop_val = fill_price + atr_at_fill * stop_atr_multiple
                 else:
-                    if not np.isnan(atr_at_fill) and atr_at_fill > 0 and stop_atr_multiple > 0:
-                        if sig == 1:
-                            stop_val = fill_price - atr_at_fill * stop_atr_multiple
-                        else:
-                            stop_val = fill_price + atr_at_fill * stop_atr_multiple
-                    else:
-                        stop_val = np.nan
+                    stop_val = np.nan
 
-                    if tp_atr_multiple > 0 and not np.isnan(atr_at_fill) and atr_at_fill > 0:
-                        if sig == 1:
-                            tp_val = fill_price + atr_at_fill * tp_atr_multiple
-                        else:
-                            tp_val = fill_price - atr_at_fill * tp_atr_multiple
+                if tp_atr_multiple > 0 and not np.isnan(atr_at_fill) and atr_at_fill > 0:
+                    if sig == 1:
+                        tp_val = fill_price + atr_at_fill * tp_atr_multiple
                     else:
-                        tp_val = np.nan
+                        tp_val = fill_price - atr_at_fill * tp_atr_multiple
+                else:
+                    tp_val = np.nan
 
                 # Max daily risk gate
                 skip_entry = False
@@ -773,18 +646,6 @@ def run(
                                 else:
                                     stop_val = fill_price + tight_dist
 
-                        # Signal-mode hard ATR floor — sticky, full life of trade.
-                        # Computed at fill time from atrs[i-1] (lookahead-safe).
-                        if (exit_mode == "signal"
-                                and signal_hard_stop_atr_multiple > 0
-                                and not np.isnan(atr_at_fill) and atr_at_fill > 0):
-                            if sig == 1:
-                                signal_hard_floor = entry_px - atr_at_fill * signal_hard_stop_atr_multiple
-                            else:
-                                signal_hard_floor = entry_px + atr_at_fill * signal_hard_stop_atr_multiple
-                        else:
-                            signal_hard_floor = float("nan")
-
                         pos = _Position(
                             direction=sig,
                             size=contracts,
@@ -795,7 +656,6 @@ def run(
                             original_size=contracts,
                             stop_distance=abs(entry_px - stop_val),
                             strategy_name=strategy_name,
-                            signal_hard_stop=signal_hard_floor,
                         )
                         positions.append(pos)
                         last_entry_bar = i
