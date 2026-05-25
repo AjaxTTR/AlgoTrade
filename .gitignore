@@ -35,6 +35,7 @@ output/
 
 # Data files
 data/*.csv
+data/dukascopy/
 
 # Research output
 research/results.csv
